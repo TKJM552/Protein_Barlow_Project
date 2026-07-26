@@ -1,0 +1,36 @@
+# Exact `pip freeze` of the original macOS / Python 3.9 laptop venv, kept for
+# reference and for reproducing local results bit-for-bit.
+#
+# Do NOT use this on a GPU pod: torch==2.8.0 here resolves to the macOS wheel,
+# and several pins (numpy 2.0.2, scipy 1.13.1, contourpy 1.3.0) are the last
+# Python 3.9-compatible releases and will not resolve on a modern pod image.
+# Use requirements.txt there instead.
+biopython==1.85
+certifi==2026.6.17
+charset-normalizer==3.4.9
+contourpy==1.3.0
+cycler==0.12.1
+filelock==3.19.1
+fonttools==4.60.2
+fsspec==2025.10.0
+idna==3.18
+importlib_resources==6.5.2
+Jinja2==3.1.6
+kiwisolver==1.4.7
+MarkupSafe==3.0.3
+matplotlib==3.9.4
+mpmath==1.3.0
+networkx==3.2.1
+numpy==2.0.2
+packaging==26.2
+pillow==11.3.0
+pyparsing==3.3.2
+python-dateutil==2.9.0.post0
+requests==2.32.5
+scipy==1.13.1
+six==1.17.0
+sympy==1.14.0
+torch==2.8.0
+typing_extensions==4.16.0
+urllib3==2.6.3
+zipp==3.23.1

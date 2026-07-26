@@ -1,0 +1,17 @@
+# Training dependencies -- this is all a GPU pod needs.
+#
+# IMPORTANT: install torch FIRST, matching the pod's CUDA version, then run
+# this file. Most GPU images already ship a CUDA-enabled torch, in which case
+# `pip install -r requirements.txt` will simply leave it alone.
+#
+#   # CUDA 12.1 example -- check `nvidia-smi` for the driver's CUDA version
+#   pip install torch --index-url https://download.pytorch.org/whl/cu121
+#   pip install -r requirements.txt
+#
+# torch is left unpinned on purpose: pinning an exact version here fights the
+# pod's preinstalled CUDA build and can silently drag in a CPU-only wheel.
+torch>=2.2
+numpy>=1.24
+
+# Rebuilding the dataset from RCSB additionally needs requirements-data.txt.
+# You only need that if you are NOT using the committed processed_dataset/.

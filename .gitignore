@@ -1,0 +1,35 @@
+# --- large data / artifacts -------------------------------------------------
+# Raw RCSB downloads: ~3.9 GB of .cif. Regenerate with `python get_files.py`.
+pdb_dataset/
+
+# Checkpoints: ~500 MB EACH (43M params x fp32 x model+optimizer+scheduler).
+# A single one exceeds GitHub's 100 MB per-file hard limit.
+checkpoints/
+*.pt
+*.pth
+
+# NOTE: processed_dataset/ is deliberately NOT ignored. It is the actual training
+# input (~23 MB of .npz) and is committed so a fresh GPU pod can train straight
+# after `git clone`, with no 3.9 GB re-download from RCSB.
+
+# --- python -----------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# --- environments -----------------------------------------------------------
+.venv/
+venv/
+env/
+
+# --- editors / OS -----------------------------------------------------------
+.DS_Store
+.vscode/
+.idea/
+*.swp
+
+# --- run outputs ------------------------------------------------------------
+*.log
+runs/
+wandb/
