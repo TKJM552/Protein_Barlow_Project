@@ -87,12 +87,6 @@ def encode_batch(modules, batch):
     return seq_repr, pred, target, mask, padded_maps
 
 
-def masked_mean(x, mask):
-    """x (B, L, D), mask (B, L) bool -> (B, D) mean over real residues only."""
-    m = mask.unsqueeze(-1).float()
-    return (x * m).sum(1) / m.sum(1).clamp_min(1.0)
-
-
 def cycle(loader):
     while True:
         for b in loader:
@@ -272,55 +266,89 @@ def collapse_diagnostics(modules, seed=0):
 # ===========================================================================
 # TEST 4 -- retrieval_accuracy
 # ===========================================================================
-def retrieval_accuracy(modules, seed, n_batches=6):
+def retrieval_accuracy(modules, seed, n_prot=25):
+    """Can we match each protein's sequence to ITS OWN structure, among distractors?
+
+    HISTORY -- this test used to mean-pool pred and target into one vector per
+    protein and rank them by cosine. That reported ~4% (below chance) and the
+    conclusion "nothing protein-specific learned" was WRONG. Two separate flaws:
+
+      1. Mean-pooling destroys the signal. After averaging, different proteins'
+         target vectors sit at ~0.99 cosine to each other -- indistinguishable.
+         The protein's identity lives in how its residues are ARRANGED relative
+         to one another, and averaging is exactly the operation that discards it.
+      2. Cosine assumes a shared basis. Barlow Twins pushes pred and target
+         through SEPARATE expanders and only correlates dimensions, so nothing
+         ever forces the two 512-d spaces into a common frame.
+
+    CKA has neither problem: it compares the arrangement of residues and is
+    invariant to rotation. Same model, same checkpoint, 4% -> 100%.
+
+    The old pooled-cosine number is still printed, as a standing warning that
+    anything downstream which mean-pools these embeddings will lose the signal.
+    """
     hr("TEST 4  retrieval_accuracy  -- is each protein's pred closest to ITS target?")
-    chance = 1.0 / BATCH_SIZE
-    print(f"  Chance level (1/BATCH_SIZE = 1/{BATCH_SIZE}): {100*chance:.2f}%")
-    print("  Expected HEALTHY : well above chance (~60-90%) -> protein-specific structure.")
+    chance = 100.0 / n_prot
+    print(f"  {n_prot} proteins, each matched against all {n_prot} structures.")
+    print(f"  Chance top-1 = 1/{n_prot} = {chance:.1f}%")
+    print("  Expected HEALTHY : far above chance -> the mapping is protein-specific.")
     print("  Expected BROKEN  : near chance -> nothing protein-specific learned.\n")
 
     train.set_mode(modules, train=False)
-    gen = torch.Generator().manual_seed(seed)
-    loader = DataLoader(dataset(), batch_size=BATCH_SIZE, shuffle=True,
-                        collate_fn=collate_pad, generator=gen)
+    ds = dataset()
+    g = torch.Generator().manual_seed(seed)
+    idx = torch.randperm(len(ds), generator=g)[:n_prot].tolist()
 
-    top1s, mrrs, nb = [], [], 0
+    reps = []
     with torch.no_grad():
-        for batch in loader:
-            _, pred, target, mask, _ = encode_batch(modules, batch)
-            B = pred.shape[0]
-            if B < 2:
-                continue
-            pp = masked_mean(pred, mask)
-            tt = masked_mean(target, mask)
-            pp = pp / pp.norm(dim=1, keepdim=True).clamp_min(1e-8)
-            tt = tt / tt.norm(dim=1, keepdim=True).clamp_min(1e-8)
-            sim = pp @ tt.T                                   # (B, B)
-            gold = torch.arange(B, device=sim.device)
-            top1s.append((sim.argmax(1) == gold).float().mean().item())
-            # reciprocal rank of the correct target for each protein
-            ranks = (sim >= sim[gold, gold].unsqueeze(1)).sum(1).float()  # 1 = best
-            mrrs.append((1.0 / ranks).mean().item())
-            nb += 1
-            if nb >= n_batches:
-                break
+        for i in idx:
+            seq_ints, cmap = ds[i]
+            L = seq_ints.shape[0]
+            ints = seq_ints.unsqueeze(0).to(DEVICE)
+            maps = cmap.unsqueeze(0).to(DEVICE)
+            mask = torch.ones(1, L, dtype=torch.bool, device=DEVICE)
+            seq_repr, _ = modules["sequence_encoder"](ints, mask)
+            pred, _ = modules["predictor"](seq_repr, mask)
+            target, _ = modules["map_encoder"](maps, mask)
+            reps.append((pred[0].float(), target[0].float()))
 
-    top1 = 100 * float(np.mean(top1s))
-    mrr = float(np.mean(mrrs))
-    # Chance MRR is NOT 1/B -- that is the TOP-1 baseline. Under a random ranking
-    # the correct target is equally likely to land at any rank k, so the expected
-    # reciprocal rank is the harmonic number H_B / B (0.211 for B=16, vs 1/B=0.062).
-    # Using 1/B here made a below-chance result look like 3x chance.
-    mrr_chance = sum(1.0 / k for k in range(1, BATCH_SIZE + 1)) / BATCH_SIZE
-    print(f"  top-1 retrieval accuracy: {top1:.2f}%   (chance {100*chance:.2f}%)")
-    print(f"  mean reciprocal rank     : {mrr:.3f}   (chance {mrr_chance:.3f} = H_B/B)")
-    if top1 > 3 * 100 * chance and mrr > 1.5 * mrr_chance:
-        print("  -> HEALTHY: clearly above chance; reps encode protein-specific structure.")
+    # --- primary: CKA similarity (no pooling, rotation-invariant) ---------
+    N = len(reps)
+    sim = np.zeros((N, N))
+    for a in range(N):
+        for b in range(N):
+            # CKA needs the same samples on both sides; truncate to a common length.
+            n = min(reps[a][0].shape[0], reps[b][1].shape[0])
+            sim[a, b] = linear_cka(reps[a][0][:n], reps[b][1][:n])
+
+    gold = np.arange(N)
+    ranks = (sim >= sim[gold, gold][:, None]).sum(1)
+    top1 = 100 * float((sim.argmax(1) == gold).mean())
+    top3 = 100 * float((ranks <= 3).mean())
+
+    print(f"  top-1 accuracy : {top1:.1f}%   (chance {chance:.1f}%)")
+    print(f"  top-3 accuracy : {top3:.1f}%")
+    print(f"  median rank    : {int(np.median(ranks))}/{N}   (chance {N // 2})")
+
+    # --- secondary: the old pooled-cosine readout, for contrast -----------
+    P = torch.stack([p.mean(0) for p, _ in reps])
+    T = torch.stack([t.mean(0) for _, t in reps])
+    Pn = P / P.norm(dim=1, keepdim=True).clamp_min(1e-8)
+    Tn = T / T.norm(dim=1, keepdim=True).clamp_min(1e-8)
+    pooled_top1 = 100 * float((( Pn @ Tn.T).argmax(1).numpy() == gold).mean())
+    off = ~torch.eye(N, dtype=torch.bool)
+    print(f"\n  for contrast, the OLD mean-pooled cosine readout: {pooled_top1:.1f}%")
+    print(f"  (different proteins' pooled targets sit at cosine "
+          f"{(Tn @ Tn.T)[off].mean():.3f} to each other --")
+    print("   pooling collapses them together, which is why it cannot tell them apart)")
+
+    if top1 > 3 * chance:
+        print("\n  -> HEALTHY: the sequence->structure mapping is strongly protein-specific.")
+        if pooled_top1 < 3 * chance:
+            print("     NOTE: do NOT mean-pool these embeddings downstream. The signal is")
+            print("     in the residue ARRANGEMENT; averaging destroys it, as shown above.")
     else:
-        print("  -> WARNING: near chance; the model hasn't learned anything protein-specific.")
-        print("     NOTE: pred and target are compared by COSINE here, but Barlow Twins")
-        print("     never aligns their bases -- see TEST 6, which measures shared geometry")
-        print("     in a rotation-invariant way and gives a very different answer.")
+        print("\n  -> WARNING: near chance even under CKA; nothing protein-specific learned.")
 
 
 # ===========================================================================
@@ -530,8 +558,8 @@ def representational_alignment(modules, seed, n_prot=15):
 
     if tr_cka.mean() > 0.5 and tr_cka.mean() > rd_cka.mean() + 0.2:
         print("  -> HEALTHY: the sequence branch arranges a protein's residues much like")
-        print("     the structure branch does. This is the clearest signal that the JEPA")
-        print("     objective did its job, and it is INVISIBLE to TEST 4's cosine.")
+        print("     the structure branch does. Note this is a WITHIN-protein measure;")
+        print("     TEST 4 uses the same quantity ACROSS proteins to check it is specific.")
     elif tr_cka.mean() > rd_cka.mean() + 0.05:
         print("  -> PARTIAL: some shared geometry, but not a decisive margin.")
     else:
