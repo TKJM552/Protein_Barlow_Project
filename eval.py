@@ -35,6 +35,13 @@ from seq_encoder import ProteinSequenceDataset, collate_pad, BATCH_SIZE
 DEVICE = train.DEVICE
 DATA_DIR = train.DATA_DIR
 
+# Number of residues every CKA ranking comparison is computed over. CKA is
+# inflated when estimated from fewer samples, so comparisons of different
+# lengths are not rankable against each other -- a short decoy would beat the
+# true structure. Fixing the length makes every comparison like for like.
+# (The dataset median length is 218, so most proteins qualify.)
+CMP_LEN = 150
+
 
 def refresh_from_train():
     """Re-read the values train.apply_cli_overrides() may have just changed.
@@ -297,7 +304,22 @@ def retrieval_accuracy(modules, seed, n_prot=25):
     train.set_mode(modules, train=False)
     ds = dataset()
     g = torch.Generator().manual_seed(seed)
-    idx = torch.randperm(len(ds), generator=g)[:n_prot].tolist()
+
+    # Every CKA in the ranking must be computed over the SAME number of residues:
+    # fewer samples inflates CKA, so mixing lengths would let short decoys beat
+    # the true structure. Restrict to proteins at least CMP_LEN long, then compare
+    # exactly the first CMP_LEN residues of each.
+    # Break as soon as we have enough -- a list comprehension over the full
+    # permutation would decompress every .npz in the dataset.
+    idx = []
+    for i in torch.randperm(len(ds), generator=g).tolist():
+        if len(ds[i][0]) >= CMP_LEN:
+            idx.append(i)
+            if len(idx) >= n_prot:
+                break
+    if len(idx) < 2:
+        print(f"  too few proteins of length >= {CMP_LEN}; skipping.")
+        return
 
     reps = []
     with torch.no_grad():
@@ -317,9 +339,7 @@ def retrieval_accuracy(modules, seed, n_prot=25):
     sim = np.zeros((N, N))
     for a in range(N):
         for b in range(N):
-            # CKA needs the same samples on both sides; truncate to a common length.
-            n = min(reps[a][0].shape[0], reps[b][1].shape[0])
-            sim[a, b] = linear_cka(reps[a][0][:n], reps[b][1][:n])
+            sim[a, b] = linear_cka(reps[a][0][:CMP_LEN], reps[b][1][:CMP_LEN])
 
     gold = np.arange(N)
     ranks = (sim >= sim[gold, gold][:, None]).sum(1)
