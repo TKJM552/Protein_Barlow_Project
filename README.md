@@ -19,6 +19,14 @@ off-diagonal redundancy term.
 
 ---
 
+## Start here
+
+- **[FINDINGS.md](FINDINGS.md)** — results of the 50-epoch run, why it plateaued,
+  the ranked next experiments, and the measurement traps. Read before running
+  another experiment.
+- **[POD_SETUP.md](POD_SETUP.md)** — the RunPod sequence that works, including
+  the `/workspace` slowness that costs 5 minutes per invocation if ignored.
+
 ## Quickstart on a GPU pod
 
 The processed dataset is committed, so there is nothing to download:
@@ -115,6 +123,7 @@ python eval.py --test all --ckpt $CKPT_DIR/best.pt
 | `collapse` | Are the representations degenerate (dead dims, low effective rank)? |
 | `retrieval` | Is each protein's prediction closest to *its own* target? |
 | `probe` | Does a frozen encoder + linear probe beat random init and a distance-only baseline on long-range contacts? |
+| `alignment` | Do the two branches share a geometry? (CKA vs an untrained model) |
 
 Without `--ckpt` the model is randomly initialized, which is a meaningful run —
 it should produce the "broken/near-chance" numbers and confirm the diagnostics are
@@ -154,7 +163,9 @@ snapshot, so a rebuild today may not return exactly the same 5000 structures.
 | [predictor.py](predictor.py) | Per-residue MLP head mapping sequence reps → map reps |
 | [barlow_twins.py](barlow_twins.py) | Expanders + the redundancy-reduction loss |
 | [train.py](train.py) | Joint training loop, checkpointing, CLI |
-| [eval.py](eval.py) | The five diagnostics above |
+| [eval.py](eval.py) | The six diagnostics above |
+| [compare_embeddings.py](compare_embeddings.py) | One protein through both branches: CKA, per-residue cosine, ranking vs controls |
+| [test_novel.py](test_novel.py) | Fetches unseen structures from RCSB and runs the same comparison |
 | [get_files.py](get_files.py) | RCSB query + `.cif` download |
 | [get_inputs_outputs.py](get_inputs_outputs.py) | `.cif` → sequence + contact map `.npz` |
 
