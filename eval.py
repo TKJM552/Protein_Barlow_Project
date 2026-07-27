@@ -110,8 +110,13 @@ def hr(title):
 # ===========================================================================
 def overfit_tiny(modules, steps=300, seed=0):
     hr("TEST 1  overfit_tiny  -- can the model memorize 4 proteins?")
-    print("Expected HEALTHY : loss drops dramatically toward its floor (>~70% drop).")
-    print("Expected BROKEN  : loss plateaus near its start -> gradients not flowing.\n")
+    print("Judged on ON_DIAG (invariance), not total loss. Total loss is dominated by")
+    print("lambda*off_diag, and with only 4 proteins the residue count N is far below")
+    print("EXPANDER_DIM, so the cross-correlation is rank-deficient and off_diag has a")
+    print("floor it CANNOT reach zero from. Thresholding the total therefore reports")
+    print("'PARTIAL' even when gradients are flowing perfectly.\n")
+    print("Expected HEALTHY : on_diag drops steeply (>~70%).")
+    print("Expected BROKEN  : on_diag plateaus near its start -> gradients not flowing.\n")
 
     ds = dataset()
     loader = DataLoader(Subset(ds, list(range(4))), batch_size=4,
@@ -123,19 +128,25 @@ def overfit_tiny(modules, steps=300, seed=0):
     opt = torch.optim.AdamW(all_params(modules), lr=train.LR,
                             weight_decay=train.WEIGHT_DECAY)
 
-    losses = []
+    losses, ons = [], []
     for step in range(steps):
         opt.zero_grad(set_to_none=True)
         loss, on_d, off_d = train.forward_loss(modules, batch, use_amp=False)
         loss.backward()
         opt.step()
         losses.append(loss.item())
+        ons.append(on_d.item())
         if step % 25 == 0 or step == steps - 1:
             print(f"  step {step:3d}: loss {loss.item():10.3f}  (on {on_d.item():.3f}, off {off_d.item():.1f})")
 
-    first, last = losses[0], min(losses[-1], min(losses))
+    # Total loss is reported for context, but the VERDICT is on on_diag.
+    t_first, t_last = losses[0], min(losses[-1], min(losses))
+    first, last = ons[0], min(ons[-1], min(ons))
     drop = (first - last) / max(abs(first), 1e-9)
-    print(f"\n  first loss {first:.3f} -> last loss {last:.3f}   ({100*drop:.1f}% drop)")
+    t_drop = (t_first - t_last) / max(abs(t_first), 1e-9)
+    print(f"\n  total loss {t_first:.3f} -> {t_last:.3f}   ({100*t_drop:.1f}% drop, "
+          f"floored by off_diag -- ignore)")
+    print(f"  ON_DIAG    {first:.3f} -> {last:.3f}   ({100*drop:.1f}% drop)  <- the verdict")
     if drop > 0.7:
         print("  -> HEALTHY: gradients flow and the model can fit a tiny set.")
     elif drop > 0.2:
@@ -296,12 +307,20 @@ def retrieval_accuracy(modules, seed, n_batches=6):
 
     top1 = 100 * float(np.mean(top1s))
     mrr = float(np.mean(mrrs))
+    # Chance MRR is NOT 1/B -- that is the TOP-1 baseline. Under a random ranking
+    # the correct target is equally likely to land at any rank k, so the expected
+    # reciprocal rank is the harmonic number H_B / B (0.211 for B=16, vs 1/B=0.062).
+    # Using 1/B here made a below-chance result look like 3x chance.
+    mrr_chance = sum(1.0 / k for k in range(1, BATCH_SIZE + 1)) / BATCH_SIZE
     print(f"  top-1 retrieval accuracy: {top1:.2f}%   (chance {100*chance:.2f}%)")
-    print(f"  mean reciprocal rank     : {mrr:.3f}   (chance {chance:.3f})")
-    if top1 > 3 * 100 * chance:
+    print(f"  mean reciprocal rank     : {mrr:.3f}   (chance {mrr_chance:.3f} = H_B/B)")
+    if top1 > 3 * 100 * chance and mrr > 1.5 * mrr_chance:
         print("  -> HEALTHY: clearly above chance; reps encode protein-specific structure.")
     else:
         print("  -> WARNING: near chance; the model hasn't learned anything protein-specific.")
+        print("     NOTE: pred and target are compared by COSINE here, but Barlow Twins")
+        print("     never aligns their bases -- see TEST 6, which measures shared geometry")
+        print("     in a rotation-invariant way and gives a very different answer.")
 
 
 # ===========================================================================
@@ -451,12 +470,82 @@ def linear_probe(modules, seed, n_train=60, n_test=30):
 
 
 # ===========================================================================
+# TEST 6 -- representational_alignment (CKA)
+# ===========================================================================
+def linear_cka(X, Y):
+    """Linear CKA between two (N, D) representations of the SAME N samples.
+
+    Rotation- and scale-invariant: it asks whether the two spaces induce the same
+    geometry over the samples (which residues sit near which), NOT whether their
+    coordinate axes agree. That is the right question here -- Barlow Twins pushes
+    pred and target through SEPARATE expanders and only correlates dimensions, so
+    nothing ever forces the two 512-d spaces into a shared basis. A plain cosine
+    between pred_i and target_i therefore reads ~0 even when training worked.
+    """
+    X = X - X.mean(0, keepdim=True)
+    Y = Y - Y.mean(0, keepdim=True)
+    num = (Y.T @ X).norm() ** 2
+    den = (X.T @ X).norm() * (Y.T @ Y).norm()
+    return float(num / den.clamp_min(1e-12))
+
+
+def representational_alignment(modules, seed, n_prot=15):
+    hr("TEST 6  representational_alignment  -- do the two branches share a geometry?")
+    print("Linear CKA between pred and target, per protein, vs an UNTRAINED model.")
+    print("Expected HEALTHY : trained CKA high (>0.5) and far above random init.")
+    print("Expected BROKEN  : trained ~= random -> training changed no geometry.\n")
+
+    ds = dataset()
+    g = torch.Generator().manual_seed(seed)
+    idx = torch.randperm(len(ds), generator=g)[:n_prot].tolist()
+
+    train.set_seed(seed + 999)
+    random_modules = train.build_modules()      # untrained baseline
+    for m in random_modules.values():
+        m.eval()
+    train.set_mode(modules, train=False)
+
+    def cka_for(mods, i):
+        seq_ints, cmap = ds[i]
+        L = seq_ints.shape[0]
+        ints = seq_ints.unsqueeze(0).to(DEVICE)
+        maps = cmap.unsqueeze(0).to(DEVICE)
+        mask = torch.ones(1, L, dtype=torch.bool, device=DEVICE)
+        with torch.no_grad():
+            seq_repr, _ = mods["sequence_encoder"](ints, mask)
+            pred, _ = mods["predictor"](seq_repr, mask)
+            target, _ = mods["map_encoder"](maps, mask)
+        return linear_cka(pred[0].float(), target[0].float())
+
+    tr_cka = np.array([cka_for(modules, i) for i in idx])
+    rd_cka = np.array([cka_for(random_modules, i) for i in idx])
+
+    print(f"  {'':16}{'mean':>8}{'min':>8}{'max':>8}")
+    print("  " + "-" * 40)
+    print(f"  {'trained':16}{tr_cka.mean():>8.3f}{tr_cka.min():>8.3f}{tr_cka.max():>8.3f}")
+    print(f"  {'random init':16}{rd_cka.mean():>8.3f}{rd_cka.min():>8.3f}{rd_cka.max():>8.3f}")
+    wins = int((tr_cka > rd_cka).sum())
+    print(f"\n  trained higher on {wins}/{n_prot} proteins   "
+          f"(mean gain {tr_cka.mean() - rd_cka.mean():+.3f})")
+
+    if tr_cka.mean() > 0.5 and tr_cka.mean() > rd_cka.mean() + 0.2:
+        print("  -> HEALTHY: the sequence branch arranges a protein's residues much like")
+        print("     the structure branch does. This is the clearest signal that the JEPA")
+        print("     objective did its job, and it is INVISIBLE to TEST 4's cosine.")
+    elif tr_cka.mean() > rd_cka.mean() + 0.05:
+        print("  -> PARTIAL: some shared geometry, but not a decisive margin.")
+    else:
+        print("  -> WARNING: training did not align the two representation spaces.")
+
+
+# ===========================================================================
 # CLI
 # ===========================================================================
 def main():
     ap = argparse.ArgumentParser(description="Protein JEPA diagnostics")
     ap.add_argument("--test", required=True,
-                    choices=["overfit", "shuffled", "collapse", "retrieval", "probe", "all"])
+                    choices=["overfit", "shuffled", "collapse", "retrieval", "probe",
+                             "alignment", "all"])
     ap.add_argument("--ckpt", default=None, help="checkpoint path (default: random init)")
     ap.add_argument("--seed", type=int, default=0)
     train.add_override_args(ap)   # --data-dir / --ckpt-dir / --device / --batch-size / ...
@@ -486,6 +575,9 @@ def main():
     if t in ("probe", "all"):
         m, _ = build_setup(args.ckpt, args.seed)
         linear_probe(m, seed=args.seed)
+    if t in ("alignment", "all"):
+        m, _ = build_setup(args.ckpt, args.seed)
+        representational_alignment(m, seed=args.seed)
 
 
 if __name__ == "__main__":

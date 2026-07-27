@@ -33,3 +33,6 @@ env/
 *.log
 runs/
 wandb/
+
+# Structures downloaded on demand by test_novel.py
+novel_cache/
