@@ -10,7 +10,13 @@
 #
 # torch is left unpinned on purpose: pinning an exact version here fights the
 # pod's preinstalled CUDA build and can silently drag in a CPU-only wheel.
-torch>=2.2
+#
+# The >=2.3 floor is load-bearing, not aspirational. train.py builds its scaler as
+# `amp.GradScaler(device=DEVICE.type)`, and the unified `torch.amp.GradScaler`
+# only landed in 2.3 -- in 2.2 that name does not exist under torch.amp at all
+# (there is only `torch.cuda.amp.GradScaler`, which takes no `device`). On 2.2 a
+# run therefore dies at startup, AFTER the dataset scan, which is the slow part.
+torch>=2.3
 numpy>=1.24
 
 # Rebuilding the dataset from RCSB additionally needs requirements-data.txt.

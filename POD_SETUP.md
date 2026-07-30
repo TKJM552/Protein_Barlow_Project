@@ -43,10 +43,24 @@ python -c "import torch; print(torch.__version__, torch.cuda.is_available(), tor
 ```
 
 Must print `True`. **If torch already imports, do not run
-`pip install -r requirements.txt`** — if the template ships torch older than the
-`>=2.2` floor, pip will upgrade it and can replace the working CUDA build with a
-CPU-only wheel. Training needs only torch and numpy, both already present on any
-PyTorch template.
+`pip install -r requirements.txt`** — pip may upgrade it and replace the working
+CUDA build with a CPU-only wheel. Training needs only torch and numpy, both
+already present on any PyTorch template.
+
+Check the version by hand, though, because the `>=2.3` floor is real: `train.py`
+builds its scaler with `torch.amp.GradScaler(device=...)`, which does not exist
+in 2.2. The run would die at startup, *after* the slow dataset scan.
+
+```bash
+python -c "import torch; assert torch.__version__ >= '2.3', torch.__version__"
+```
+
+If the template is older, upgrade from the CUDA index so you keep a GPU wheel —
+never a bare `pip install -U torch`:
+
+```bash
+pip install -U torch --index-url https://download.pytorch.org/whl/cu121   # match nvidia-smi
+```
 
 ## Build the dataset
 
@@ -130,6 +144,72 @@ nvidia-smi                                      # GPU-Util should be high
 ```
 
 Watch for `WARNING: frequent skips!` — that means non-finite losses.
+
+## The `free` column
+
+Every epoch line ends with `free NNN`: the fraction of `z_seq` reproducible from
+**position and chain length alone** — everything the model got without reading
+any chemistry. **High is bad.**
+
+It exists because Barlow Twins treats each residue as a sample, and both branches
+can work out where they are in the chain. `z_seq = z_map = f(position)` satisfies
+the objective perfectly while learning nothing, it is an attractor the model can
+drift into at *any* epoch, and **val loss falls as it drifts** — so val loss will
+never warn you, and `best.pt` is still selected on val loss. This column is the
+only thing watching.
+
+Reference points, measured:
+
+| | `free` |
+|---|---|
+| random noise (the estimator's own floor) | 0.004 |
+| untrained `z_seq` | 0.006 |
+| a purely positional representation | 0.99 |
+
+So anything up around 0.1+ and climbing means the shortcut is forming: kill the
+run rather than pay for the remaining epochs. Read the trend, not one value — it
+is biased upward by about (cells / residues) and is not comparable across
+different bin counts.
+
+## The position-centering ablation
+
+`train.py` subtracts the per-index mean before the loss, which makes a purely
+positional representation worth exactly zero (verified: it centres to 0.0000).
+The open question is whether that also costs real information. Run both arms
+**on the small 4,966-structure dataset committed to the repo** — an epoch is ~1
+minute there versus ~35 at 150k, so the whole thing is under an hour:
+
+```bash
+unset DATA_DIR                      # use the committed processed_dataset/
+python train.py --epochs 10 --seed 0 --ckpt-dir ./ck_A
+python train.py --epochs 10 --seed 0 --ckpt-dir ./ck_B --no-position-centering
+```
+
+Same `--seed`, so the split and batch order are identical and the only
+difference is the change. Then compare:
+
+```bash
+python eval.py --test probe     --ckpt ./ck_A/best.pt    # and ck_B
+python eval.py --test retrieval --ckpt ./ck_A/best.pt
+python eval.py --test alignment --ckpt ./ck_A/best.pt
+```
+
+**Decision rule.** TEST 5 (`probe`) is the one that matters — it asks whether the
+frozen encoder still contains contact information, which is the direct test of
+"was anything important lost".
+
+- probe holds within noise, A's `free` much lower than B's → centering is a free
+  win; take it to the 150k run
+- probe drops materially in A → it cost real information, and you know that in
+  under an hour instead of after a day of GPU time
+
+Two caveats. 4,966 structures is not 150,000, so this screens the *mechanism*,
+not the final numbers. And `eval.py` does not itself centre: with centering on,
+the component of `z` along the per-index mean gets no gradient, so it is
+unconstrained noise in the tests that mix indices (`retrieval`, `alignment`).
+That biases the comparison **against** arm A, so a positive result for A is
+trustworthy; an A-looks-worse result on those two specifically is the confound,
+not a finding, and `probe` is the tiebreak.
 
 ## Before terminating
 

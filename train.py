@@ -39,6 +39,7 @@ from seq_encoder import (
     dataset_lengths,
     BATCH_SIZE,
     MIN_RESIDUES,
+    PAD_IDX,
 )
 from map_encoder import ContactMapEncoder
 from barlow_twins import BarlowTwinsLoss
@@ -68,6 +69,66 @@ WARMUP_STEPS = 500
 GRAD_CLIP = 1.0
 VAL_FRACTION = 0.1
 SEED = 0
+
+# --- the positional shortcut -----------------------------------------------
+# THE FAILURE. Barlow Twins treats each RESIDUE as a sample, and both branches
+# can work out a residue's index in its chain: RoPE is relative, but the offsets
+# to the two chain ENDS pin the absolute index down, and the sequence branch has
+# full attention, so it reads both distances everywhere. `z_seq = z_map = f(index)`
+# then satisfies the objective with no chemistry learned at all -- every c_ii is
+# 1, and a positional code is high-rank and decorrelated, so it walks straight
+# through the off-diagonal term, which punishes DIMENSIONAL collapse and has
+# nothing to say about a shortcut. It is an attractor the model can drift into at
+# ANY epoch, and val loss FALLS as it drifts, so val loss will never warn you.
+#
+# THE FIX. Subtract, per residue INDEX, the mean over the proteins in the batch,
+# before the loss. Note barlow_twins_core ALREADY subtracts a mean at this point
+# (its standardization step); this only conditions that mean on the index instead
+# of pooling every residue together. What it removes is whatever every protein
+# shares at index i -- a fact about the index, not about any protein.
+#
+# What this does and does not do:
+#   * f(index) alone centres to EXACTLY zero -> no variance -> cannot produce
+#     c_ii = 1. That shortcut is dead, not merely discouraged.
+#   * f(index) * g(protein) survives, because g varies. But the two branches can
+#     only CORRELATE through g, i.e. by agreeing about this particular protein --
+#     position modulates the amplitude and cannot manufacture agreement alone.
+#     So relative structure (helix at +4, sheet pairings, contact order) is kept
+#     and rewarded in full: it differs between proteins at the same index.
+#   * position stays INFERABLE -- the spread of the deviations still varies along
+#     the chain. The claim is only that position alone stops PAYING. Whether some
+#     near-positional shortcut survives anyway is empirical, which is what
+#     free_information() below is for.
+#   * it does NOT touch the encoders' outputs, only the loss's copy of them, so
+#     nothing downstream shifts.
+#
+# The removed part is not lost, it is factored out: z = m[index] + deviation,
+# and m is a population average -- something you MEASURE, not something gradient
+# descent has to learn. Run with --no-position-centering for the B arm of the
+# ablation that checks it costs no real information (see POD_SETUP.md).
+POSITION_CENTERING = True
+MIN_PROTEINS_PER_INDEX = 2   # an index held by one protein centres to exactly
+                             # zero, so those residues leave the loss instead of
+                             # entering the statistics as fake all-zero samples
+
+# --- free-information monitor ----------------------------------------------
+# One number per epoch: the fraction of z_seq reproducible from POSITION AND
+# LENGTH alone -- everything the model got without reading chemistry. Cells are
+# (fractional-position bin, length bin), which subsumes absolute index (fixing
+# length and fraction fixes the index) and, unlike absolute-index bins, stays
+# evenly populated whatever the chain length. It therefore also catches the
+# length-normalised shortcut f(index/length), which per-index centring does not
+# fully remove.
+#
+# HIGH is bad. Read the TREND: biased upward by roughly (cells / residues),
+# ~0.004 here, so it separates 0.03 from 0.6 and is not to be quoted to three
+# decimals or compared across different bin counts. Same small-sample trap
+# FINDINGS.md records for CKA. For scale, map_encoder.py measured z_map at random
+# init at 0.033 with the relative seed.
+PROBE_PROTEINS = 192       # held-out chains, strided across the length range
+PROBE_CHUNK = 16           # padded together at a time, to cap probe memory
+N_FRAC_BINS = 24
+N_LEN_BINS = 8
 CKPT_EVERY_EPOCHS = 5
 LOG_EVERY = 25              # print a running train-loss line every N steps
 RESUME_FROM = None         # --resume PATH to continue a run; None = fresh run
@@ -97,7 +158,7 @@ def apply_cli_overrides(args):
     Values are read via getattr so eval.py, whose parser defines only the shared
     subset of these flags, can reuse this function unchanged.
     """
-    global DEVICE, USE_AMP, WARM_START, KEEP_EPOCH_CKPTS
+    global DEVICE, USE_AMP, WARM_START, KEEP_EPOCH_CKPTS, POSITION_CENTERING
 
     # argparse dest -> the module-level constant it overrides.
     for dest, constant in [
@@ -122,6 +183,8 @@ def apply_cli_overrides(args):
         WARM_START = True
     if getattr(args, "keep_epoch_ckpts", False):
         KEEP_EPOCH_CKPTS = True
+    if getattr(args, "no_position_centering", False):
+        POSITION_CENTERING = False
 
     config.amp_dtype(AMP_DTYPE)   # validate the dtype now, not 500 steps in
 
@@ -313,13 +376,41 @@ def to_device(batch):
             padded_maps.to(DEVICE, non_blocking=nb))
 
 
+def center_on_position(z, mask):
+    """Subtract, per residue INDEX, the mean across the batch's proteins.
+
+    Returns (z_centred, keep). `keep` drops indices held by fewer than
+    MIN_PROTEINS_PER_INDEX proteins: such an index centres to exactly zero, and a
+    zero row would enter the Barlow Twins statistics as a fake sample. In a
+    length-bucketed batch chains agree on length to ~1%, so this drops very
+    little -- only the tail indices of the longest chain present.
+
+    Done in fp32 even under autocast: it is a sum over up to ~100 proteins and
+    bf16 carries 8 mantissa bits.
+    """
+    counts = mask.sum(0)                                    # (L,) proteins per index
+    zf = z.float()
+    mean = (zf * mask.unsqueeze(-1)).sum(0) / counts.clamp(min=1).unsqueeze(-1)
+    return zf - mean, mask & (counts >= MIN_PROTEINS_PER_INDEX)
+
+
 def forward_loss(modules, batch, use_amp):
     padded_ints, mask, padded_maps = batch
     with amp.autocast(device_type=DEVICE.type, dtype=config.amp_dtype(AMP_DTYPE),
                       enabled=use_amp):
         z_seq, _ = modules["sequence_encoder"](padded_ints, mask)
         z_map, _ = modules["map_encoder"](padded_maps, mask)
-        loss, on_diag, off_diag = modules["expanders"](z_seq, z_map, mask)
+
+        # Each branch gets its OWN mean -- they are different representations.
+        # A one-protein batch has no population to average over and is left
+        # alone; the residue budget makes that near-unreachable (>=3 proteins in
+        # practice) but a single max-length chain could manage it.
+        keep = mask
+        if POSITION_CENTERING and mask.shape[0] >= MIN_PROTEINS_PER_INDEX:
+            z_seq, keep = center_on_position(z_seq, mask)
+            z_map, _ = center_on_position(z_map, mask)
+
+        loss, on_diag, off_diag = modules["expanders"](z_seq, z_map, keep)
     return loss, on_diag, off_diag
 
 
@@ -444,6 +535,107 @@ def validate(modules, loader, use_amp):
 
 
 # ---------------------------------------------------------------------------
+# Free-information monitor (see the constants block for what it measures)
+# ---------------------------------------------------------------------------
+def build_probe(val_set):
+    """A FIXED set of held-out chains, strided across the length range.
+
+    Fixed because this metric is only readable as a trend -- resampling every
+    epoch would move the number on its own. Strided rather than taken in order
+    because the val loader is length-bucketed, so its first batches are all short
+    chains, which would leave the length axis with nothing to condition on.
+
+    Returns padded (ints, mask) chunks, or None when the split cannot fill the
+    cells (debug runs), in which case the metric is skipped rather than quoted
+    off a handful of proteins.
+    """
+    by_length = sorted((val_set[i][0].numel(), i) for i in range(len(val_set)))
+    if len(by_length) < N_FRAC_BINS * N_LEN_BINS:
+        return None
+
+    stride = max(1, len(by_length) // PROBE_PROTEINS)
+    picked = [i for _, i in by_length[::stride]][:PROBE_PROTEINS]
+
+    chunks = []
+    for s in range(0, len(picked), PROBE_CHUNK):
+        seqs = [val_set[i][0] for i in picked[s:s + PROBE_CHUNK]]
+        width = max(x.numel() for x in seqs)
+        ints = torch.full((len(seqs), width), PAD_IDX, dtype=torch.long)
+        mask = torch.zeros((len(seqs), width), dtype=torch.bool)
+        for r, x in enumerate(seqs):
+            ints[r, :x.numel()] = x
+            mask[r, :x.numel()] = True
+        chunks.append((ints.to(DEVICE), mask.to(DEVICE)))
+    return chunks
+
+
+def _cell_ids(mask):
+    """(B, L) -> a cell index per residue, from fractional position and length."""
+    B, L = mask.shape
+    lengths = mask.sum(1)                                          # (B,)
+    idx = torch.arange(L, device=mask.device).expand(B, L)
+
+    frac = idx / (lengths - 1).clamp(min=1).unsqueeze(1)
+    frac_bin = (frac * N_FRAC_BINS).long().clamp(0, N_FRAC_BINS - 1)
+
+    # Log spacing: chain lengths are heavily skewed short, so linear bins would
+    # drop nearly every residue into the first one.
+    lo, hi = math.log(MIN_RESIDUES), math.log(config.MAX_SEQ_LENGTH)
+    t = (torch.log(lengths.float().clamp(min=1)) - lo) / (hi - lo)
+    len_bin = (t * N_LEN_BINS).long().clamp(0, N_LEN_BINS - 1)     # (B,)
+
+    return frac_bin * N_LEN_BINS + len_bin.unsqueeze(1)
+
+
+@torch.no_grad()
+def free_information(modules, probe):
+    """Fraction of z_seq's variance explained by (fractional position, length).
+
+    A variance decomposition, not a fitted probe: the best possible predictor
+    from a cell IS that cell's mean, so there is nothing to train and no
+    regularisation constant to defend. Accumulated as running sums, so the
+    representations never have to be held in memory at once.
+
+    fp32 with no autocast -- a measurement should not move when --amp-dtype does.
+    """
+    set_mode(modules, train=False)
+    encoder = modules["sequence_encoder"]
+    n_cells = N_FRAC_BINS * N_LEN_BINS
+
+    total_n, sum_sq = 0, 0.0
+    sum_z = cell_sum = cell_n = None
+
+    for ints, mask in probe:
+        z = encoder(ints, mask)[0].float()
+        flat = mask.reshape(-1)
+        z_real = z.reshape(-1, z.shape[-1])[flat]                  # (N, D)
+        cells = _cell_ids(mask).reshape(-1)[flat]                  # (N,)
+
+        if sum_z is None:
+            sum_z = torch.zeros(z_real.shape[1], device=z_real.device)
+            cell_sum = torch.zeros(n_cells, z_real.shape[1], device=z_real.device)
+            cell_n = torch.zeros(n_cells, device=z_real.device)
+
+        sum_z += z_real.sum(0)
+        sum_sq += z_real.pow(2).sum().item()
+        total_n += z_real.shape[0]
+        cell_sum.index_add_(0, cells, z_real)
+        cell_n.index_add_(0, cells, torch.ones_like(cells, dtype=cell_sum.dtype))
+
+    grand = sum_z / total_n
+    grand_sq = grand.dot(grand).item()
+
+    # var(z) = E||z||^2 - ||E z||^2, and the explained part is the same with z
+    # replaced by its cell mean.
+    total_var = sum_sq / total_n - grand_sq
+    seen = cell_n > 0
+    cell_mean = cell_sum[seen] / cell_n[seen].unsqueeze(1)
+    explained = (cell_n[seen] * cell_mean.pow(2).sum(1)).sum().item() / total_n - grand_sq
+
+    return explained / max(total_var, 1e-12)
+
+
+# ---------------------------------------------------------------------------
 # Checkpointing
 # ---------------------------------------------------------------------------
 MODULE_KEYS = ("sequence_encoder", "map_encoder", "expanders")
@@ -486,6 +678,10 @@ def save_checkpoint(path, epoch, modules, optimizer, scheduler, scaler, val_loss
         "val_loss": val_loss,
         "arch": _arch_fingerprint(modules),
         "split": _split_fingerprint(),
+        # Which arm of the position-centering ablation produced this. Stamped
+        # because the two arms are otherwise indistinguishable from the file,
+        # and comparing them is the whole point of running both.
+        "position_centered": POSITION_CENTERING,
         "sequence_encoder": modules["sequence_encoder"].state_dict(),
         "map_encoder": modules["map_encoder"].state_dict(),
         "expanders": modules["expanders"].state_dict(),
@@ -693,6 +889,7 @@ def main(smoke_only=False):
           f"workers {NUM_WORKERS}")
     print(f"  epochs            : {EPOCHS}   total steps {total_steps}")
     print(f"  lr / weight_decay : {LR} / {WEIGHT_DECAY}   warmup {WARMUP_STEPS}")
+    print(f"  position centring : {'ON' if POSITION_CENTERING else 'OFF (ablation B)'}")
     print(f"  grad clip / amp   : {GRAD_CLIP} / "
           f"{AMP_DTYPE if use_amp else 'off (fp32)'}"
           f"{'' if not use_amp else ' (scaler ' + ('on' if scaler.is_enabled() else 'off') + ')'}")
@@ -728,6 +925,10 @@ def main(smoke_only=False):
         print("--smoke-test: wiring check only, exiting before training.")
         return
 
+    probe = build_probe(val_loader.dataset)
+    if probe is None:
+        print("free-information monitor: OFF (val split too small to fill the cells)")
+
     # --- real run ----------------------------------------------------------
     global_step = (start_epoch - 1) * steps_per_epoch
     for epoch in range(start_epoch, EPOCHS + 1):
@@ -737,8 +938,15 @@ def main(smoke_only=False):
         )
         va_loss, va_on, va_off = validate(modules, val_loader, use_amp)
 
+        # Logged EVERY epoch, not spot-checked: the shortcut is an attractor the
+        # model can drift into at any point, and val loss falls as it drifts.
+        # A climbing `free` is the signal to kill the run -- note best.pt below
+        # is still selected on val loss, which cannot see this.
+        free = free_information(modules, probe) if probe else None
+
         print(f"epoch {epoch:3d} | train {tr_loss:.3f} (on {tr_on:.3f}, off {tr_off:.1f}) "
-              f"| val {va_loss:.3f} (on {va_on:.3f}, off {va_off:.1f})")
+              f"| val {va_loss:.3f} (on {va_on:.3f}, off {va_off:.1f})"
+              + (f" | free {free:.3f}" if free is not None else ""))
 
         is_best = va_loss < best_val
         if is_best:
@@ -791,6 +999,11 @@ if __name__ == "__main__":
                          "overwriting one last.pt (~500 MB each)")
     rn.add_argument("--no-amp", action="store_true",
                     help="disable mixed precision and train in full fp32")
+    rn.add_argument("--no-position-centering", action="store_true",
+                    dest="no_position_centering",
+                    help="do NOT subtract the per-index mean before the loss. "
+                         "This is the B arm of the ablation -- it restores the "
+                         "positional shortcut, so expect `free` to climb")
     rn.add_argument("--debug", action="store_true",
                     help="fast GPU-free pass over a tiny subset (cpu, 20 proteins, "
                          "2 epochs, batch 4) to catch shape/mask/wiring bugs")
