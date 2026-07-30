@@ -1,11 +1,15 @@
-"""Standalone diagnostics for the protein JEPA.
+"""Standalone diagnostics for Protein Barlow.
 
 Purpose: let you SEE whether the model actually learns, independent of the unit
 tests. Every check prints numbers next to the value you should expect if things
 are working and if they're broken -- read the output and judge for yourself.
 
-It imports the existing modules (data pipeline, SequenceEncoder, Predictor,
-MapEncoder, BarlowTwinsLoss) via train.py and does NOT reimplement them.
+It imports the existing modules (data pipeline, SequenceEncoder, MapEncoder,
+BarlowTwinsLoss) via train.py and does NOT reimplement them.
+
+Naming: the two branches are z_seq (sequence encoder) and z_map (map encoder).
+There is no prediction head and neither branch is a target -- Barlow Twins is
+symmetric in its two arguments.
 
 Usage:
     python eval.py --test overfit|shuffled|collapse|retrieval|probe|all
@@ -21,6 +25,7 @@ are calibrated.
 """
 
 import argparse
+from collections import namedtuple
 
 import numpy as np
 import torch
@@ -58,20 +63,52 @@ def refresh_from_train():
 # ===========================================================================
 # Shared setup / helpers
 # ===========================================================================
+# A checkpoint file read ONCE and reused. Several tests train and mutate weights,
+# so each needs its own freshly-built model -- but they can all be filled from the
+# same in-memory state dict instead of re-reading ~500 MB from disk per test.
+LoadedCkpt = namedtuple("LoadedCkpt", "path data")
+
+
+def load_ckpt(path):
+    """Read a checkpoint once, for repeated use by build_setup. None passes through."""
+    return LoadedCkpt(path, train.read_checkpoint(path)) if path else None
+
+
 def build_setup(ckpt, seed):
-    """Seed everything, build the model, optionally load a checkpoint."""
+    """Seed everything, build the model, optionally load a checkpoint.
+
+    `ckpt` is a LoadedCkpt (see load_ckpt) or None for random init.
+
+    A checkpoint written before an architecture change still loads: train.py keeps
+    every tensor that still fits and reinitialises the rest. That is deliberately
+    NOT silent here -- a partly-random map encoder makes TESTS 3, 4 and 6 (all of
+    which read `z_map`) meaningless, and biases 1 and 2 -- so the names of the
+    affected modules go into the status line every test prints.
+    """
     train.set_seed(seed)
     modules = train.build_modules()
     if ckpt:
-        epoch, val = train.load_checkpoint(ckpt, modules)
-        status = f"checkpoint '{ckpt}' (epoch {epoch}, val {val:.3f})"
+        epoch, val, skipped = train.load_checkpoint(ckpt.data, modules, label=ckpt.path)
+        status = f"checkpoint '{ckpt.path}' (epoch {epoch}, val {val:.3f})"
+        if skipped:
+            stale = sorted({s.split(".")[0] for s in skipped})
+            status += (f"  ** PARTIAL LOAD: {', '.join(stale)} partly RANDOM "
+                       f"({len(skipped)} tensor(s)) -- any number below that reads "
+                       f"those modules is not a measurement of a trained model **")
     else:
         status = "RANDOM INIT (no checkpoint) -- expect broken/near-chance numbers"
     return modules, status
 
 
+_DATASET = None
+
+
 def dataset():
-    return ProteinSequenceDataset(DATA_DIR)
+    """The processed dataset, scanned once per process and shared by every test."""
+    global _DATASET
+    if _DATASET is None:
+        _DATASET = ProteinSequenceDataset(DATA_DIR)
+    return _DATASET
 
 
 def set_dropout_zero(modules):
@@ -86,12 +123,16 @@ def all_params(modules):
 
 
 def encode_batch(modules, batch):
-    """Run the full forward and return the intermediate reps + mask + maps."""
+    """Run the full forward and return both branches + mask + maps.
+
+    z_seq is the sequence encoder's own output -- with the prediction head gone it
+    is both what the loss shapes and what downstream code consumes, so there is no
+    longer a separate pre-head representation to return.
+    """
     padded_ints, mask, padded_maps = train.to_device(batch)
-    seq_repr, _ = modules["sequence_encoder"](padded_ints, mask)
-    pred, _ = modules["predictor"](seq_repr, mask)
-    target, _ = modules["map_encoder"](padded_maps, mask)
-    return seq_repr, pred, target, mask, padded_maps
+    z_seq, _ = modules["sequence_encoder"](padded_ints, mask)
+    z_map, _ = modules["map_encoder"](padded_maps, mask)
+    return z_seq, z_map, mask, padded_maps
 
 
 def cycle(loader):
@@ -254,17 +295,17 @@ def collapse_diagnostics(modules, seed=0):
                         collate_fn=collate_pad)
     with torch.no_grad():
         batch = next(iter(loader))
-        _, pred, target, mask, _ = encode_batch(modules, batch)
-        loss, on_d, off_d = modules["expanders"](pred, target, mask)
-        pred_r = pred[mask].cpu()
-        target_r = target[mask].cpu()
+        z_seq, z_map, mask, _ = encode_batch(modules, batch)
+        loss, on_d, off_d = modules["expanders"](z_seq, z_map, mask)
+        seq_r = z_seq[mask].cpu()
+        map_r = z_map[mask].cpu()
 
-    _rep_stats("pred  ", pred_r, seed)
+    _rep_stats("z_seq ", seq_r, seed)
     print()
-    _rep_stats("target", target_r, seed)
+    _rep_stats("z_map ", map_r, seed)
 
     print(f"\n  Barlow Twins terms (separately):")
-    print(f"    on_diag  {on_d.item():10.3f}   invariance -- high = pred doesn't match target")
+    print(f"    on_diag  {on_d.item():10.3f}   invariance -- high = the two views disagree")
     print(f"    off_diag {off_d.item():10.1f}   redundancy -- high = dimensions correlated (collapse)")
     print("    Healthy training drives BOTH down; a large residual off_diag with tiny")
     print("    on_diag means the two views agree but are collapsing onto few dimensions.")
@@ -276,15 +317,15 @@ def collapse_diagnostics(modules, seed=0):
 def retrieval_accuracy(modules, seed, n_prot=25):
     """Can we match each protein's sequence to ITS OWN structure, among distractors?
 
-    HISTORY -- this test used to mean-pool pred and target into one vector per
+    HISTORY -- this test used to mean-pool z_seq and z_map into one vector per
     protein and rank them by cosine. That reported ~4% (below chance) and the
     conclusion "nothing protein-specific learned" was WRONG. Two separate flaws:
 
       1. Mean-pooling destroys the signal. After averaging, different proteins'
-         target vectors sit at ~0.99 cosine to each other -- indistinguishable.
+         z_map vectors sit at ~0.99 cosine to each other -- indistinguishable.
          The protein's identity lives in how its residues are ARRANGED relative
          to one another, and averaging is exactly the operation that discards it.
-      2. Cosine assumes a shared basis. Barlow Twins pushes pred and target
+      2. Cosine assumes a shared basis. Barlow Twins pushes z_seq and z_map
          through SEPARATE expanders and only correlates dimensions, so nothing
          ever forces the two 512-d spaces into a common frame.
 
@@ -294,7 +335,7 @@ def retrieval_accuracy(modules, seed, n_prot=25):
     The old pooled-cosine number is still printed, as a standing warning that
     anything downstream which mean-pools these embeddings will lose the signal.
     """
-    hr("TEST 4  retrieval_accuracy  -- is each protein's pred closest to ITS target?")
+    hr("TEST 4  retrieval_accuracy  -- is each protein's z_seq closest to ITS z_map?")
     chance = 100.0 / n_prot
     print(f"  {n_prot} proteins, each matched against all {n_prot} structures.")
     print(f"  Chance top-1 = 1/{n_prot} = {chance:.1f}%")
@@ -329,10 +370,9 @@ def retrieval_accuracy(modules, seed, n_prot=25):
             ints = seq_ints.unsqueeze(0).to(DEVICE)
             maps = cmap.unsqueeze(0).to(DEVICE)
             mask = torch.ones(1, L, dtype=torch.bool, device=DEVICE)
-            seq_repr, _ = modules["sequence_encoder"](ints, mask)
-            pred, _ = modules["predictor"](seq_repr, mask)
-            target, _ = modules["map_encoder"](maps, mask)
-            reps.append((pred[0].float(), target[0].float()))
+            z_seq, _ = modules["sequence_encoder"](ints, mask)
+            z_map, _ = modules["map_encoder"](maps, mask)
+            reps.append((z_seq[0].float(), z_map[0].float()))
 
     # --- primary: CKA similarity (no pooling, rotation-invariant) ---------
     N = len(reps)
@@ -351,14 +391,17 @@ def retrieval_accuracy(modules, seed, n_prot=25):
     print(f"  median rank    : {int(np.median(ranks))}/{N}   (chance {N // 2})")
 
     # --- secondary: the old pooled-cosine readout, for contrast -----------
+    # .cpu() before .numpy(): reps live on DEVICE, and on CUDA/MPS the conversion
+    # raises outright -- which used to abort this test (and the rest of --test all)
+    # on exactly the machines the model is trained on.
     P = torch.stack([p.mean(0) for p, _ in reps])
     T = torch.stack([t.mean(0) for _, t in reps])
     Pn = P / P.norm(dim=1, keepdim=True).clamp_min(1e-8)
     Tn = T / T.norm(dim=1, keepdim=True).clamp_min(1e-8)
-    pooled_top1 = 100 * float((( Pn @ Tn.T).argmax(1).numpy() == gold).mean())
-    off = ~torch.eye(N, dtype=torch.bool)
+    pooled_top1 = 100 * float(((Pn @ Tn.T).argmax(1).cpu().numpy() == gold).mean())
+    off = ~torch.eye(N, dtype=torch.bool, device=Tn.device)
     print(f"\n  for contrast, the OLD mean-pooled cosine readout: {pooled_top1:.1f}%")
-    print(f"  (different proteins' pooled targets sit at cosine "
+    print(f"  (different proteins' pooled z_map sit at cosine "
           f"{(Tn @ Tn.T)[off].mean():.3f} to each other --")
     print("   pooling collapses them together, which is why it cannot tell them apart)")
 
@@ -443,9 +486,29 @@ def _auc(scores, labels):
     return ((ranks[labels == 1].sum() - n_pos * (n_pos + 1) / 2) / (n_pos * n_neg)).item()
 
 
-def _evaluate_probe(enc, probe, mu, sd, ds, idx_list, mode, max_pairs=60000, seed=0):
-    """Long-range (|i-j|>12) precision@L/5, averaged over test proteins, plus pooled AUC."""
-    g = torch.Generator().manual_seed(seed)
+# Pairs scored in one go. The 1024-d features are what is large, not the scores:
+# this bounds peak memory at ~200 MB while still ranking every pair.
+PAIR_CHUNK = 50_000
+
+
+def _score_pairs(probe, mu, sd, V, iu, ju, mode):
+    """Probe score for EVERY (iu, ju) pair, built in chunks."""
+    scores = []
+    with torch.no_grad():
+        for s in range(0, len(iu), PAIR_CHUNK):
+            sl = slice(s, s + PAIR_CHUNK)
+            scores.append(probe((_pair_feat(V, iu[sl], ju[sl], mode) - mu) / sd).squeeze(1))
+    return torch.cat(scores)
+
+
+def _evaluate_probe(enc, probe, mu, sd, ds, idx_list, mode):
+    """Long-range (|i-j|>12) precision@L/5, averaged over test proteins, plus pooled AUC.
+
+    Every long-range pair is ranked. P@L/5 is defined over the complete set, and
+    this used to subsample a random 60,000 first: a 990-residue chain has ~494k
+    long-range pairs, so only 12% of them were ranked and the metric quietly meant
+    something different for long chains than for short ones.
+    """
     precisions, all_scores, all_labels = [], [], []
     for idx in idx_list:
         V, cmap = _protein_repr(enc, ds, idx) if mode != "distance" else (None, ds[idx][1].cpu())
@@ -455,12 +518,7 @@ def _evaluate_probe(enc, probe, mu, sd, ds, idx_list, mode, max_pairs=60000, see
         iu, ju = iu[lr], ju[lr]
         if len(iu) < 5:
             continue
-        if len(iu) > max_pairs:                               # cap for tractability
-            keep = torch.randperm(len(iu), generator=g)[:max_pairs]
-            iu, ju = iu[keep], ju[keep]
-        feat = (_pair_feat(V, iu, ju, mode) - mu) / sd
-        with torch.no_grad():
-            scores = probe(feat).squeeze(1)
+        scores = _score_pairs(probe, mu, sd, V, iu, ju, mode)
         labels = cmap[iu, ju]
         k = max(1, L // 5)
         top = scores.topk(min(k, len(scores))).indices
@@ -475,7 +533,7 @@ def linear_probe(modules, seed, n_train=60, n_test=30):
     hr("TEST 5  linear_probe  -- does the FROZEN encoder contain contact information?")
     print("Precision@L/5 on LONG-RANGE (|i-j|>12) contacts -- the field-standard metric.")
     print("Expected: trained encoder > random encoder > distance-only.")
-    print("Verdict rules: if trained <= random, JEPA added nothing; if trained does not")
+    print("Verdict rules: if trained <= random, pretraining added nothing; if trained does not")
     print("beat distance-only on long-range, it only learned the trivial 'near in")
     print("sequence = near in space' prior, not real structure.\n")
 
@@ -497,7 +555,7 @@ def linear_probe(modules, seed, n_train=60, n_test=30):
     ]:
         Xtr, ytr = _sample_train_pairs(enc, ds, tr_idx, mode, seed=seed)
         probe, mu, sd = _train_logreg(Xtr, ytr, in_dim, seed=seed)
-        p_at, auc = _evaluate_probe(enc, probe, mu, sd, ds, te_idx, mode, seed=seed)
+        p_at, auc = _evaluate_probe(enc, probe, mu, sd, ds, te_idx, mode)
         rows.append((label, p_at, auc))
 
     print(f"  {'probe':<18}{'P@L/5 (long-range)':<22}{'AUC':<8}")
@@ -508,7 +566,7 @@ def linear_probe(modules, seed, n_train=60, n_test=30):
     trained_p, random_p, dist_p = rows[0][1], rows[1][1], rows[2][1]
     print("\n  VERDICT:")
     if trained_p <= random_p + 1e-6:
-        print("  * trained <= random  -> JEPA pretraining added NOTHING over random weights.")
+        print("  * trained <= random  -> pretraining added NOTHING over random weights.")
     elif trained_p <= dist_p + 1e-6:
         print("  * trained > random but <= distance-only -> only the trivial sequence-")
         print("    proximity prior; no real long-range structure learned.")
@@ -526,9 +584,9 @@ def linear_cka(X, Y):
     Rotation- and scale-invariant: it asks whether the two spaces induce the same
     geometry over the samples (which residues sit near which), NOT whether their
     coordinate axes agree. That is the right question here -- Barlow Twins pushes
-    pred and target through SEPARATE expanders and only correlates dimensions, so
+    z_seq and z_map through SEPARATE expanders and only correlates dimensions, so
     nothing ever forces the two 512-d spaces into a shared basis. A plain cosine
-    between pred_i and target_i therefore reads ~0 even when training worked.
+    between z_seq_i and z_map_i therefore reads ~0 even when training worked.
     """
     X = X - X.mean(0, keepdim=True)
     Y = Y - Y.mean(0, keepdim=True)
@@ -539,7 +597,7 @@ def linear_cka(X, Y):
 
 def representational_alignment(modules, seed, n_prot=15):
     hr("TEST 6  representational_alignment  -- do the two branches share a geometry?")
-    print("Linear CKA between pred and target, per protein, vs an UNTRAINED model.")
+    print("Linear CKA between z_seq and z_map, per protein, vs an UNTRAINED model.")
     print("Expected HEALTHY : trained CKA high (>0.5) and far above random init.")
     print("Expected BROKEN  : trained ~= random -> training changed no geometry.\n")
 
@@ -560,10 +618,9 @@ def representational_alignment(modules, seed, n_prot=15):
         maps = cmap.unsqueeze(0).to(DEVICE)
         mask = torch.ones(1, L, dtype=torch.bool, device=DEVICE)
         with torch.no_grad():
-            seq_repr, _ = mods["sequence_encoder"](ints, mask)
-            pred, _ = mods["predictor"](seq_repr, mask)
-            target, _ = mods["map_encoder"](maps, mask)
-        return linear_cka(pred[0].float(), target[0].float())
+            z_seq, _ = mods["sequence_encoder"](ints, mask)
+            z_map, _ = mods["map_encoder"](maps, mask)
+        return linear_cka(z_seq[0].float(), z_map[0].float())
 
     tr_cka = np.array([cka_for(modules, i) for i in idx])
     rd_cka = np.array([cka_for(random_modules, i) for i in idx])
@@ -590,7 +647,7 @@ def representational_alignment(modules, seed, n_prot=15):
 # CLI
 # ===========================================================================
 def main():
-    ap = argparse.ArgumentParser(description="Protein JEPA diagnostics")
+    ap = argparse.ArgumentParser(description="Protein Barlow diagnostics")
     ap.add_argument("--test", required=True,
                     choices=["overfit", "shuffled", "collapse", "retrieval", "probe",
                              "alignment", "all"])
@@ -604,27 +661,29 @@ def main():
     train.apply_cli_overrides(args)
     refresh_from_train()
 
-    modules, status = build_setup(args.ckpt, args.seed)
+    # Read the checkpoint once; every build_setup below fills a fresh model from it.
+    ckpt = load_ckpt(args.ckpt)
+    _, status = build_setup(ckpt, args.seed)
     print(f"device: {DEVICE} | model: {status} | seed: {args.seed}")
 
     t = args.test
     # overfit / shuffled TRAIN and mutate weights, so give each its own fresh model.
     if t in ("overfit", "all"):
-        m, _ = build_setup(args.ckpt, args.seed)
+        m, _ = build_setup(ckpt, args.seed)
         overfit_tiny(m, seed=args.seed)
     if t in ("shuffled", "all"):
-        shuffled_control(args.ckpt, args.seed)
+        shuffled_control(ckpt, args.seed)
     if t in ("collapse", "all"):
-        m, _ = build_setup(args.ckpt, args.seed)
+        m, _ = build_setup(ckpt, args.seed)
         collapse_diagnostics(m, seed=args.seed)
     if t in ("retrieval", "all"):
-        m, _ = build_setup(args.ckpt, args.seed)
+        m, _ = build_setup(ckpt, args.seed)
         retrieval_accuracy(m, seed=args.seed)
     if t in ("probe", "all"):
-        m, _ = build_setup(args.ckpt, args.seed)
+        m, _ = build_setup(ckpt, args.seed)
         linear_probe(m, seed=args.seed)
     if t in ("alignment", "all"):
-        m, _ = build_setup(args.ckpt, args.seed)
+        m, _ = build_setup(ckpt, args.seed)
         representational_alignment(m, seed=args.seed)
 
 

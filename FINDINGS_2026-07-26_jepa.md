@@ -1,3 +1,22 @@
+# ARCHIVED — Findings from the 50-epoch run, 26 July 2026 (JEPA architecture)
+
+> **These numbers do not describe the current model.** They were produced by an
+> architecture that no longer exists, which differed in two ways:
+>
+> 1. **A predictor head.** The sequence branch ran through a per-residue MLP whose
+>    output was matched against the map branch. That head is gone; the loss now
+>    compares the sequence encoder's own output (`z_seq`) with the map encoder's
+>    (`z_map`) directly, and the objective is symmetric — nothing is a "target".
+> 2. **A 2-scalar map seed** (local degree, long-range degree), diagnosed below as
+>    the run's ceiling. Each residue is now seeded with its own contact-map row,
+>    indexed by relative offset.
+>
+> Kept because the **measurement traps** section at the bottom is architecture-
+> independent and every trap in it was paid for. Read that; treat every number
+> above it as history. Live notebook: [FINDINGS.md](FINDINGS.md).
+
+---
+
 # Findings — 50-epoch run, 26 July 2026
 
 First real training run. RTX 4090, ~1 min/epoch, 50 epochs in under an hour,
@@ -68,6 +87,12 @@ encode much. Everything downstream inherits that ceiling.
 
 Also relevant: 86% of the loss is `lambda*off_diag`, only 14% is prediction.
 
+> **ACTED ON, 27 July 2026.** The 2-scalar seed is gone — each residue now enters
+> the map encoder as its own contact-map row, indexed by relative offset `j − i`
+> and projected `1999 → 512`. On one 581-residue chain the seed matrix goes from
+> mean pairwise cosine 0.906 / rank 2 to 0.586 / rank 327. See the banner at the
+> top of this file: this diagnosis was acted on, but the fix is unmeasured.
+
 ---
 
 ## What is NOT known
@@ -86,9 +111,11 @@ Also relevant: 86% of the loss is `lambda*off_diag`, only 14% is prediction.
 
 ## Next experiments, ranked
 
-1. **Widen `SEED_DIM`** (`map_encoder.py:28`) — multiple distance bands, local
-   clustering coefficient, normalised sequence position. Highest leverage,
-   cheapest to try, targets the diagnosed bottleneck.
+1. ~~**Widen `SEED_DIM`**~~ — **done, unmeasured.** Went further than "more
+   summary statistics": the seed is now the raw contact row (see the note above).
+   The run that tests whether this lifts the ceiling has not happened. Judge it on
+   `on_diag` and on P@L/5, *not* on total loss or CKA — and run TEST 2 before
+   believing any of it, for the reason in the last measurement trap below.
 2. **Contact head + the scratch control.** A `(B, L, L)` output head with dilated
    2D convolutions, `BCEWithLogitsLoss(pos_weight≈50)` for the 1.8% base rate,
    symmetrised output. Reduce 512→~64 dims *before* going 2D — a
@@ -120,7 +147,29 @@ Also relevant: 86% of the loss is `lambda*off_diag`, only 14% is prediction.
   total down with it. Reported "PARTIAL" where the truth was a 96% `on_diag` drop.
 - **Every metric needs an untrained baseline.** CKA 0.87 looks unremarkable until
   you see random init scores 0.08.
+- **A richer target can be a POSITION LEAK, and every agreement metric here would
+  applaud it.** Found while building the row seed, before any training run. About
+  4 of every 10 contacts sit at `|i−j| ≤ 2` and are present in 99.8% of those
+  slots — consecutive CA atoms are ~3.8 Å apart, always inside the 8 Å threshold.
+  Index the seed row by *absolute* partner index and that always-on band lands in
+  columns `i−2..i+2`: a pure function of `i`, identical in every protein. Measured
+  R² of predicting the target from position alone, 120 chains:
+
+  | seeding | seed | encoder target |
+  |---|---|---|
+  | absolute index | 0.573 | 0.620 |
+  | relative offset `j−i` | 0.031 | 0.033 |
+  | old 2-scalar | 0.047 | — |
+
+  62% of an absolute-indexed target is reproducible from RoPE position alone, so
+  the sequence branch could satisfy Barlow Twins while learning no structure —
+  and `on_diag`, CKA, and TEST 4 retrieval would all *improve*. **TEST 2 is the
+  only diagnostic here that catches it**: a position-only solution survives
+  rolling the maps, so the real-vs-shuffled gap collapses. Hence `SEED_MODE =
+  "relative"`. Re-run check (g) of `python map_encoder.py` after any change to
+  how the map is fed in.
 
 Three of the five original diagnostics gave misleading verdicts on this run. All
 three were measurement bugs, not model bugs. Fix the instrument before trusting
-any experiment run through it.
+any experiment run through it — and note that the trap above is the first one
+found in the *model* that the instruments would have rewarded rather than caught.

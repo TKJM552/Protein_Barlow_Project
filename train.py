@@ -1,15 +1,21 @@
-"""Joint training loop for the protein JEPA.
+"""Joint training loop for Protein Barlow.
 
 Wires together the already-built components (imported, not reimplemented):
 
-  DataLoader -> SequenceEncoder -> Predictor -> pred  \
-                                                       Barlow Twins loss
-                MapEncoder ------------------------> target /
+  DataLoader -> SequenceEncoder -> z_seq \
+                                          Barlow Twins loss
+                MapEncoder -----> z_map  /
+
+Two encoders read the SAME protein through different windows -- one sees only the
+amino-acid sequence, the other only the contact map -- and Barlow Twins is asked
+to make the two representations agree dimension-for-dimension. Neither branch
+predicts the other and neither is a "target": the objective is symmetric, so the
+two are named z_seq and z_map.
 
 This is JOINT training: ONE AdamW optimizer holds the parameters of the sequence
-encoder, the predictor, the map encoder, AND the Barlow Twins expanders. There is
-no frozen branch, no stop-gradient, and no EMA -- collapse is prevented purely by
-the loss's off-diagonal term (see barlow_twins.py).
+encoder, the map encoder, AND the Barlow Twins expanders. There is no frozen
+branch, no stop-gradient, and no EMA -- collapse is prevented purely by the loss's
+off-diagonal term (see barlow_twins.py).
 """
 
 import os
@@ -28,10 +34,12 @@ from seq_encoder import (
     TokenEmbedding,
     RoPEEncoder,
     ProteinSequenceDataset,
+    LengthBucketSampler,
     collate_pad,
+    dataset_lengths,
     BATCH_SIZE,
+    MIN_RESIDUES,
 )
-from predictor import build_predictor
 from map_encoder import ContactMapEncoder
 from barlow_twins import BarlowTwinsLoss
 
@@ -49,6 +57,9 @@ CKPT_DIR = config.CKPT_DIR
 DEVICE = config.resolve_device()
 NUM_WORKERS = config.NUM_WORKERS
 AMP_DTYPE = config.AMP_DTYPE
+# Training batches are formed by residue budget (see LengthBucketSampler), so
+# BATCH_SIZE above is NOT what governs a training step -- this is.
+RESIDUES_PER_BATCH = config.RESIDUES_PER_BATCH
 
 LR = 3e-4
 WEIGHT_DECAY = 1e-2
@@ -60,7 +71,15 @@ SEED = 0
 CKPT_EVERY_EPOCHS = 5
 LOG_EVERY = 25              # print a running train-loss line every N steps
 RESUME_FROM = None         # --resume PATH to continue a run; None = fresh run
+WARM_START = False         # --warm-start: allow --resume across an ARCHITECTURE
+                           # change. Loads only the weights that still fit, drops
+                           # the optimizer state, restarts the LR schedule.
 USE_AMP = True             # --no-amp to force full fp32 (cpu runs ignore this)
+KEEP_EPOCH_CKPTS = False   # --keep-epoch-ckpts: write epoch_NNN.pt every
+                           # CKPT_EVERY_EPOCHS instead of rolling one last.pt.
+                           # Off by default: 10 snapshots of a 43M-param model
+                           # plus optimizer state is 5.2 GB, and only the newest
+                           # is a useful resume point.
 
 # --- debug-mode state (inert unless --debug is passed) ---------------------
 DEBUG_MAX_PROTEINS = None   # None = use the whole dataset (normal runs)
@@ -78,7 +97,7 @@ def apply_cli_overrides(args):
     Values are read via getattr so eval.py, whose parser defines only the shared
     subset of these flags, can reuse this function unchanged.
     """
-    global DEVICE, USE_AMP
+    global DEVICE, USE_AMP, WARM_START, KEEP_EPOCH_CKPTS
 
     # argparse dest -> the module-level constant it overrides.
     for dest, constant in [
@@ -88,16 +107,21 @@ def apply_cli_overrides(args):
         ("weight_decay", "WEIGHT_DECAY"), ("warmup_steps", "WARMUP_STEPS"),
         ("seed", "SEED"), ("ckpt_every", "CKPT_EVERY_EPOCHS"),
         ("resume", "RESUME_FROM"),
+        ("residues_per_batch", "RESIDUES_PER_BATCH"),
     ]:
         value = getattr(args, dest, None)
         if value is not None:
             globals()[constant] = value
 
-    # These two need more than a straight assignment.
+    # These need more than a straight assignment.
     if getattr(args, "device", None) is not None:
         DEVICE = config.resolve_device(args.device)
     if getattr(args, "no_amp", False):
         USE_AMP = False
+    if getattr(args, "warm_start", False):
+        WARM_START = True
+    if getattr(args, "keep_epoch_ckpts", False):
+        KEEP_EPOCH_CKPTS = True
 
     config.amp_dtype(AMP_DTYPE)   # validate the dtype now, not 500 steps in
 
@@ -117,7 +141,14 @@ def add_override_args(parser):
                    help="autocast dtype (env: AMP_DTYPE; bf16 needs no loss scaling, "
                         "prefer it on A100/H100)")
     g.add_argument("--batch-size", type=int, default=None,
-                   help="proteins per batch (env: BATCH_SIZE)")
+                   help="proteins per batch for eval.py's diagnostics (env: "
+                        "BATCH_SIZE). NOT used by training -- see "
+                        "--residues-per-batch")
+    g.add_argument("--residues-per-batch", type=int, default=None,
+                   help="training batch budget in residues (env: "
+                        "RESIDUES_PER_BATCH). Batches group proteins of similar "
+                        "length and close at (proteins x longest chain); this is "
+                        "the knob to lower on OOM. Keep it above ~2048")
     return g
 
 
@@ -130,15 +161,16 @@ def apply_debug_overrides():
     optimizer, loss, training loop, collate) is identical, so shape/mask/wiring
     bugs surface here exactly as they would on a GPU.
     """
-    global DEVICE, EPOCHS, BATCH_SIZE, DEBUG_MAX_PROTEINS, CKPT_PREFIX
+    global DEVICE, EPOCHS, BATCH_SIZE, RESIDUES_PER_BATCH, DEBUG_MAX_PROTEINS, CKPT_PREFIX
     DEVICE = torch.device("cpu")   # torch.device (not the str "cpu") so DEVICE.type
                                    # still works for autocast / GradScaler / .to()
     EPOCHS = 2
-    BATCH_SIZE = 4                 # several small batches -> exercises padding/masking
+    BATCH_SIZE = 4
+    RESIDUES_PER_BATCH = 1024      # several small batches -> exercises padding/masking
     DEBUG_MAX_PROTEINS = 20
     CKPT_PREFIX = "debug_"
-    print("*** DEBUG MODE: cpu, 20 proteins, 2 epochs, batch 4 -- bug-catching only, "
-          "not a real run ***")
+    print("*** DEBUG MODE: cpu, 20 proteins, 2 epochs, 1024 residues/batch -- "
+          "bug-catching only, not a real run ***")
 
 
 # ---------------------------------------------------------------------------
@@ -172,6 +204,17 @@ def set_seed(seed):
 # Data
 # ---------------------------------------------------------------------------
 def build_loaders():
+    """Train/val loaders, both batched by residue budget rather than protein count.
+
+    Batches group proteins of similar length (LengthBucketSampler), which is where
+    ~50% of this model's training FLOPs used to go: collate_pad pads every protein
+    up to the batch's longest member, so a random batch of 16 drawn from chains of
+    40..990 residues did 2.41x the useful work. See the sampler's docstring for why
+    the budget is counted in RESIDUES and not proteins.
+
+    Shuffling now lives in the sampler (which re-forms batches every epoch), so the
+    loaders take a batch_sampler and no shuffle= flag.
+    """
     full = ProteinSequenceDataset(DATA_DIR)
     # Debug only: cap the dataset BEFORE the split so BOTH train and val draw from
     # the capped set. The split logic below is otherwise unchanged.
@@ -192,10 +235,20 @@ def build_loaders():
         pin_memory=(DEVICE.type == "cuda"),
         persistent_workers=NUM_WORKERS > 0,
     )
-    train_loader = DataLoader(train_set, batch_size=BATCH_SIZE, shuffle=True,
-                              **loader_kwargs)
-    val_loader = DataLoader(val_set, batch_size=BATCH_SIZE, shuffle=False,
-                            **loader_kwargs)
+    train_loader = DataLoader(
+        train_set,
+        batch_sampler=LengthBucketSampler(dataset_lengths(train_set),
+                                          RESIDUES_PER_BATCH, shuffle=True, seed=SEED),
+        **loader_kwargs,
+    )
+    val_loader = DataLoader(
+        val_set,
+        # Validation is a measurement: fixed batches so the number is comparable
+        # epoch to epoch.
+        batch_sampler=LengthBucketSampler(dataset_lengths(val_set),
+                                          RESIDUES_PER_BATCH, shuffle=False),
+        **loader_kwargs,
+    )
     return train_loader, val_loader, n_train, n_val
 
 
@@ -203,16 +256,20 @@ def build_loaders():
 # Modules + optimizer + scheduler
 # ---------------------------------------------------------------------------
 def build_modules():
+    # No prediction head between the sequence encoder and the loss: the expanders
+    # inside BarlowTwinsLoss are already a per-residue MLP on each branch, so a
+    # second one added nothing the loss could not express. Its removal means
+    # sequence_encoder's OWN output is what the objective shapes -- which is also
+    # the tensor load_sequence_encoder() hands to downstream code.
     return {
         "sequence_encoder": SequenceEncoder().to(DEVICE),
-        "predictor": build_predictor().to(DEVICE),
         "map_encoder": ContactMapEncoder().to(DEVICE),
         "expanders": BarlowTwinsLoss().to(DEVICE),   # the loss module owns the expanders
     }
 
 
 def build_optimizer(modules, total_steps):
-    # ONE optimizer over ALL parameters: encoder + predictor + map encoder + expanders.
+    # ONE optimizer over ALL parameters: sequence encoder + map encoder + expanders.
     param_list = []
     for name, m in modules.items():
         params = list(m.parameters())
@@ -220,7 +277,17 @@ def build_optimizer(modules, total_steps):
         param_list += params
     assert len(param_list) > 0, "optimizer received no parameters"
 
-    optimizer = torch.optim.AdamW(param_list, lr=LR, weight_decay=WEIGHT_DECAY)
+    # Weight decay on matrices only. Every 1-D parameter here is a bias or a
+    # LayerNorm/BatchNorm gain -- shrinking those toward zero is not
+    # regularisation, it drags the normalisation statistics the network relies on.
+    # (Embeddings are 2-D and keep decay, the usual convention.)
+    decay = [p for p in param_list if p.ndim >= 2]
+    no_decay = [p for p in param_list if p.ndim < 2]
+    optimizer = torch.optim.AdamW(
+        [{"params": decay, "weight_decay": WEIGHT_DECAY},
+         {"params": no_decay, "weight_decay": 0.0}],
+        lr=LR,
+    )
 
     # Linear warmup for WARMUP_STEPS, then cosine decay over the remaining steps.
     def lr_lambda(step):
@@ -250,10 +317,9 @@ def forward_loss(modules, batch, use_amp):
     padded_ints, mask, padded_maps = batch
     with amp.autocast(device_type=DEVICE.type, dtype=config.amp_dtype(AMP_DTYPE),
                       enabled=use_amp):
-        seq_repr, _ = modules["sequence_encoder"](padded_ints, mask)
-        pred, _ = modules["predictor"](seq_repr, mask)
-        target, _ = modules["map_encoder"](padded_maps, mask)
-        loss, on_diag, off_diag = modules["expanders"](pred, target, mask)
+        z_seq, _ = modules["sequence_encoder"](padded_ints, mask)
+        z_map, _ = modules["map_encoder"](padded_maps, mask)
+        loss, on_diag, off_diag = modules["expanders"](z_seq, z_map, mask)
     return loss, on_diag, off_diag
 
 
@@ -265,25 +331,38 @@ def set_mode(modules, train):
 # ---------------------------------------------------------------------------
 # Smoke test: one train step + one val step, assert wiring before the real run
 # ---------------------------------------------------------------------------
-def smoke_test(modules, train_loader, val_loader):
-    print("running smoke test (1 train step + 1 val step)...")
+def smoke_test(modules, train_loader, val_loader, use_amp, scaler):
+    """One train step + one val step, on DEVICE, at the run's REAL precision.
 
-    # --- one train step: finite loss + grads reach ALL four groups ---------
+    use_amp/scaler are threaded in rather than hardcoded to fp32 on purpose. This
+    is the check the README tells you to run before committing a GPU to a job, so
+    it has to exercise the path the job will actually take: an fp32 smoke test
+    cannot see a loss that only overflows under autocast, which is exactly the
+    failure mode barlow_twins_core now guards against.
+    """
+    print(f"running smoke test (1 train step + 1 val step, "
+          f"{AMP_DTYPE if use_amp else 'fp32'})...")
+
+    # --- one train step: finite loss + grads reach ALL module groups -------
     set_mode(modules, train=True)
     for m in modules.values():
         for p in m.parameters():
             p.grad = None
 
     batch = to_device(next(iter(train_loader)))
-    loss, on_d, off_d = forward_loss(modules, batch, use_amp=False)
-    assert torch.isfinite(loss), "smoke: train loss is not finite"
-    loss.backward()
+    loss, on_d, off_d = forward_loss(modules, batch, use_amp)
+    assert torch.isfinite(loss), (
+        f"smoke: train loss is not finite ({loss.item()}) at "
+        f"{AMP_DTYPE if use_amp else 'fp32'} -- on_diag {on_d.item()}, "
+        f"off_diag {off_d.item()}")
+    scaler.scale(loss).backward()
 
     for name, m in modules.items():
         assert any(p.grad is not None for p in m.parameters()), \
             f"smoke: no gradient reached {name!r} -- wiring error"
 
-    # Clear the smoke-test grads so real training starts clean.
+    # Clear the smoke-test grads so real training starts clean. The scaler is
+    # untouched: it was only used to scale a backward we are discarding.
     for m in modules.values():
         for p in m.parameters():
             p.grad = None
@@ -292,11 +371,11 @@ def smoke_test(modules, train_loader, val_loader):
     set_mode(modules, train=False)
     with torch.no_grad():
         vbatch = to_device(next(iter(val_loader)))
-        vloss, _, _ = forward_loss(modules, vbatch, use_amp=False)
+        vloss, _, _ = forward_loss(modules, vbatch, use_amp)
     assert torch.isfinite(vloss), "smoke: val loss is not finite"
 
     print(f"smoke test passed: train loss {loss.item():.3f}, val loss {vloss.item():.3f}, "
-          f"grads reached all 4 groups.\n")
+          f"grads reached all {len(modules)} groups.\n")
 
 
 # ---------------------------------------------------------------------------
@@ -305,15 +384,19 @@ def smoke_test(modules, train_loader, val_loader):
 def train_one_epoch(modules, loader, optimizer, scheduler, scaler, param_list,
                     use_amp, epoch, global_step):
     set_mode(modules, train=True)
-    running, running_on, running_off, n = 0.0, 0.0, 0.0, 0
-    skips = 0
+    # Running (loss, on_diag, off_diag) accumulated ON DEVICE. Calling .item() per
+    # step forces a device->host sync that stalls the pipeline; these are only read
+    # back at the log line and the epoch summary.
+    totals = torch.zeros(3, device=DEVICE)
+    n, skips = 0, 0
 
     for i, raw in enumerate(loader):
         batch = to_device(raw)
         optimizer.zero_grad(set_to_none=True)
         loss, on_d, off_d = forward_loss(modules, batch, use_amp)
 
-        # NaN/inf guard: never let a bad batch poison the weights.
+        # NaN/inf guard: never let a bad batch poison the weights. This read does
+        # sync, and it stays -- the alternative is silently training on garbage.
         if not torch.isfinite(loss):
             skips += 1
             print(f"  [epoch {epoch} step {i}] non-finite loss -> skipping optimizer step")
@@ -327,13 +410,12 @@ def train_one_epoch(modules, loader, optimizer, scheduler, scaler, param_list,
         scheduler.step()
         global_step += 1
 
-        running += loss.item()
-        running_on += on_d.item()
-        running_off += off_d.item()
+        totals += torch.stack((loss.detach(), on_d, off_d))
         n += 1
         if n % LOG_EVERY == 0:
-            print(f"  [epoch {epoch} step {i}] loss {running / n:.3f} "
-                  f"(on {running_on / n:.3f}, off {running_off / n:.1f}) "
+            avg_loss, avg_on, avg_off = (totals / n).tolist()
+            print(f"  [epoch {epoch} step {i}] loss {avg_loss:.3f} "
+                  f"(on {avg_on:.3f}, off {avg_off:.1f}) "
                   f"lr {scheduler.get_last_lr()[0]:.2e}")
 
     if skips:
@@ -341,39 +423,71 @@ def train_one_epoch(modules, loader, optimizer, scheduler, scaler, param_list,
         warn = "  WARNING: frequent skips!" if frac > 0.05 else ""
         print(f"  epoch {epoch}: skipped {skips}/{len(loader)} batches (non-finite).{warn}")
 
-    avg = running / max(1, n)
-    return avg, running_on / max(1, n), running_off / max(1, n), global_step
+    avg_loss, avg_on, avg_off = (totals / max(1, n)).tolist()
+    return avg_loss, avg_on, avg_off, global_step
 
 
 @torch.no_grad()
 def validate(modules, loader, use_amp):
     set_mode(modules, train=False)
-    total, total_on, total_off, n = 0.0, 0.0, 0.0, 0
+    totals = torch.zeros(3, device=DEVICE)
+    n = 0
     for raw in loader:
         batch = to_device(raw)
         loss, on_d, off_d = forward_loss(modules, batch, use_amp)
         if not torch.isfinite(loss):
             continue
-        total += loss.item()
-        total_on += on_d.item()
-        total_off += off_d.item()
+        totals += torch.stack((loss, on_d, off_d))
         n += 1
-    return total / max(1, n), total_on / max(1, n), total_off / max(1, n)
+    avg_loss, avg_on, avg_off = (totals / max(1, n)).tolist()
+    return avg_loss, avg_on, avg_off
 
 
 # ---------------------------------------------------------------------------
 # Checkpointing
 # ---------------------------------------------------------------------------
+MODULE_KEYS = ("sequence_encoder", "map_encoder", "expanders")
+
+
+def _arch_fingerprint(modules):
+    """The architecture facts that decide whether a checkpoint can be reloaded.
+
+    Stamped into every checkpoint so a later mismatch explains ITSELF instead of
+    surfacing as a bare shape error. Shapes remain the authority at load time --
+    this is for the diagnostic message.
+    """
+    map_enc = modules["map_encoder"]
+    return {
+        "map_seed_mode": getattr(map_enc, "seed_mode", "absolute"),
+        "map_max_len": getattr(map_enc, "max_len", None),
+        "param_shapes": {
+            name: {k: tuple(v.shape) for k, v in modules[name].state_dict().items()}
+            for name in MODULE_KEYS
+        },
+    }
+
+
+def _split_fingerprint():
+    """Everything needed to reproduce this run's train/val split.
+
+    Stamped in because the split is otherwise only reproducible by convention:
+    compare_embeddings.py has to re-derive it to say whether a protein was held
+    out, and reading SEED off the checkpoint beats assuming the default was used.
+    """
+    return {"seed": SEED, "val_fraction": VAL_FRACTION, "min_residues": MIN_RESIDUES}
+
+
 def save_checkpoint(path, epoch, modules, optimizer, scheduler, scaler, val_loss):
     # For DOWNSTREAM USE only `sequence_encoder` (and optionally `map_encoder`) are
-    # needed -- the predictor and the expanders are training-time scaffolding and
-    # can be dropped when using the learned representations.
+    # needed -- the expanders are training-time scaffolding and can be dropped when
+    # using the learned representations.
     torch.save({
         "epoch": epoch,
         "val_loss": val_loss,
+        "arch": _arch_fingerprint(modules),
+        "split": _split_fingerprint(),
         "sequence_encoder": modules["sequence_encoder"].state_dict(),
         "map_encoder": modules["map_encoder"].state_dict(),
-        "predictor": modules["predictor"].state_dict(),
         "expanders": modules["expanders"].state_dict(),
         "optimizer": optimizer.state_dict(),
         "scheduler": scheduler.state_dict(),
@@ -381,33 +495,139 @@ def save_checkpoint(path, epoch, modules, optimizer, scheduler, scaler, val_loss
     }, path)
 
 
-def load_checkpoint(path, modules, optimizer=None, scheduler=None, scaler=None,
-                    map_location=None):
-    """RESUME a training run from a checkpoint saved by save_checkpoint.
+def _load_module_state(module, saved, name):
+    """Load `saved` into `module`, skipping tensors that no longer fit.
 
-    Always restores the four module weights. Also restores optimizer / scheduler /
-    scaler state when those objects are passed in. Returns (epoch, val_loss) so the
-    caller can continue from epoch + 1. weights_only=False because our own
-    checkpoints hold optimizer/scheduler state (trusted, self-produced files).
+    Returns the list of skipped-key descriptions. Anything skipped keeps its fresh
+    random init. Used instead of a strict load so that an ARCHITECTURE CHANGE costs
+    you only the tensors that actually changed, rather than the whole checkpoint:
+    the map encoder's seed projection was reshaped (2 -> 1000 -> 1999 columns), but
+    its four transformer blocks, and all of the sequence encoder and expanders, are
+    unaffected and still worth loading.
     """
-    ckpt = torch.load(path, map_location=map_location or DEVICE, weights_only=False)
-    modules["sequence_encoder"].load_state_dict(ckpt["sequence_encoder"])
-    modules["map_encoder"].load_state_dict(ckpt["map_encoder"])
-    modules["predictor"].load_state_dict(ckpt["predictor"])
-    modules["expanders"].load_state_dict(ckpt["expanders"])
+    current = module.state_dict()
+    compatible, skipped = {}, []
+    for key, value in saved.items():
+        if key not in current:
+            skipped.append(f"{name}.{key}: dropped from the model")
+        elif current[key].shape != value.shape:
+            skipped.append(f"{name}.{key}: checkpoint {tuple(value.shape)} != "
+                           f"model {tuple(current[key].shape)}")
+        else:
+            compatible[key] = value
+    for key in current:
+        if key not in saved:
+            skipped.append(f"{name}.{key}: new in the model, left at init")
+    module.load_state_dict(compatible, strict=False)
+    return skipped
+
+
+def read_checkpoint(path, map_location=None):
+    """Read a checkpoint file into a dict, without touching any model.
+
+    Split out from load_checkpoint so a caller that restores the SAME file into
+    several freshly-built models pays the ~500 MB read once: `eval.py --test all`
+    builds a separate model per test and would otherwise re-read it seven times.
+    The result can be handed straight back to load_checkpoint().
+
+    weights_only=False because our own checkpoints hold optimizer state
+    (trusted, self-produced files).
+    """
+    return torch.load(path, map_location=map_location or DEVICE, weights_only=False)
+
+
+def load_checkpoint(source, modules, optimizer=None, scheduler=None, scaler=None,
+                    map_location=None, allow_arch_mismatch=False, label=None):
+    """Restore a checkpoint saved by save_checkpoint.
+
+    `source` is either a path or a dict already produced by read_checkpoint();
+    `label` names it in messages (defaults to the path).
+
+    Always restores the module weights, tensor by tensor, skipping any whose
+    shape no longer matches the current architecture (those stay at their fresh
+    init) and reporting every skip. Also restores optimizer / scheduler / scaler
+    state when those objects are passed in.
+
+    RESUMING across an architecture change is refused. AdamW's saved moments are
+    shape-bound to the parameters that produced them, so loading them onto a
+    reshaped parameter either raises deep inside the first step() or silently
+    corrupts the update. Pass allow_arch_mismatch=True to warm-start from the
+    compatible weights instead -- optimizer/scheduler/scaler state is then dropped
+    and the run restarts its LR schedule from epoch 1.
+
+    Returns (epoch, val_loss, skipped) -- skipped is the list of tensors that could
+    not be carried over, so callers can flag results computed on partly-random
+    weights.
+    """
+    ckpt = source if isinstance(source, dict) else read_checkpoint(source, map_location)
+    path = label or (source if isinstance(source, str) else "<checkpoint>")
+
+    skipped = []
+    for name in MODULE_KEYS:
+        if name not in ckpt:
+            skipped.append(f"{name}.*: absent from the checkpoint, left at init")
+            continue
+        skipped += _load_module_state(modules[name], ckpt[name], name)
+
+    # Whole modules the checkpoint carries that this architecture no longer has --
+    # e.g. `predictor`, deleted when the prediction head was removed. Dropping
+    # these is correct, but it is still an architecture mismatch and must be
+    # reported as one, not silently ignored.
+    for name in ckpt:
+        if name in MODULE_KEYS or name in ("epoch", "val_loss", "arch", "split",
+                                           "optimizer", "scheduler", "scaler"):
+            continue
+        skipped.append(f"{name}.*: module no longer exists, discarded")
+
+    resuming = optimizer is not None or scheduler is not None or scaler is not None
+
+    if skipped:
+        saved_arch = ckpt.get("arch", {})
+        print(f"WARNING: '{path}' was written by a DIFFERENT architecture. "
+              f"{len(skipped)} tensor(s) could not be carried over and are at their "
+              f"fresh random init:")
+        for line in skipped:
+            print(f"    {line}")
+        print(f"    checkpoint map-encoder seeding: "
+              f"{saved_arch.get('map_seed_mode', 'unknown (pre-dates the arch stamp)')}"
+              f" / max_len {saved_arch.get('map_max_len', 'unknown')}")
+        print(f"    this model's                  : "
+              f"{getattr(modules['map_encoder'], 'seed_mode', '?')} / max_len "
+              f"{getattr(modules['map_encoder'], 'max_len', '?')}")
+
+        if resuming and not allow_arch_mismatch:
+            raise RuntimeError(
+                f"cannot RESUME training from '{path}': the architecture changed, so "
+                f"the saved optimizer moments no longer match {len(skipped)} "
+                f"parameter(s) (see the list above). Either train from scratch, or "
+                f"pass allow_arch_mismatch=True to warm-start from the compatible "
+                f"weights with a fresh optimizer and LR schedule."
+            )
+        print("    -> any measurement that reads a module listed above is being "
+              "computed on partly-random weights.")
+
+    if skipped:
+        # Reached only with allow_arch_mismatch=True (the strict path raised above).
+        if resuming:
+            print("    -> allow_arch_mismatch: optimizer/scheduler/scaler state "
+                  "dropped; this is a WARM START, not a resume. Training restarts "
+                  "at epoch 1 with a fresh LR schedule.")
+        return 0, float("inf"), skipped
+
     if optimizer is not None:
         optimizer.load_state_dict(ckpt["optimizer"])
     if scheduler is not None:
         scheduler.load_state_dict(ckpt["scheduler"])
     if scaler is not None:
         scaler.load_state_dict(ckpt["scaler"])
-    return ckpt.get("epoch", 0), ckpt.get("val_loss", float("inf"))
+
+    return ckpt.get("epoch", 0), ckpt.get("val_loss", float("inf")), skipped
 
 
 def load_sequence_encoder(path=None, device=None):
     """DOWNSTREAM USE: rebuild just the trained sequence encoder and return it in
-    eval() mode. The predictor, map encoder, and expanders are training-time
-    scaffolding and are ignored here -- the sequence encoder is what produces the
+    eval() mode. The map encoder and expanders are training-time scaffolding and
+    are ignored here -- the sequence encoder is what produces the
     representations you actually use.
 
         enc = load_sequence_encoder()
@@ -419,9 +639,17 @@ def load_sequence_encoder(path=None, device=None):
     """
     path = path or os.path.join(CKPT_DIR, "best.pt")
     device = device or DEVICE
-    ckpt = torch.load(path, map_location=device, weights_only=False)
+    ckpt = read_checkpoint(path, map_location=device)
     enc = SequenceEncoder().to(device)
-    enc.load_state_dict(ckpt["sequence_encoder"])
+    skipped = _load_module_state(enc, ckpt["sequence_encoder"], "sequence_encoder")
+    if skipped:
+        # The map encoder's seeding has been reshaped more than once; the sequence
+        # encoder has not. A mismatch HERE means the branch you are about to use
+        # downstream is partly random, which must not pass silently.
+        raise RuntimeError(
+            f"'{path}' does not match the current SequenceEncoder:\n    "
+            + "\n    ".join(skipped)
+        )
     enc.eval()
     return enc
 
@@ -450,12 +678,18 @@ def main(smoke_only=False):
     # --- config summary ----------------------------------------------------
     n_params = {name: sum(p.numel() for p in m.parameters()) for name, m in modules.items()}
     print("=" * 64)
-    print("Protein JEPA - joint training")
+    print("Protein Barlow - joint training")
     print(f"  device            : {DEVICE}" +
           (f" ({torch.cuda.get_device_name(DEVICE)})" if DEVICE.type == "cuda" else ""))
     print(f"  data / ckpt dir   : {DATA_DIR} -> {CKPT_DIR}")
-    print(f"  train / val prot. : {n_train} / {n_val}   (val_fraction {VAL_FRACTION})")
-    print(f"  batch size        : {BATCH_SIZE}   steps/epoch {steps_per_epoch}   "
+    print(f"  train / val prot. : {n_train} / {n_val}   (val_fraction {VAL_FRACTION}, "
+          f"min length {MIN_RESIDUES})")
+    # Batches are length-bucketed under a residue budget, so proteins-per-batch
+    # varies (many short chains, few long ones). Report what that works out to.
+    batch_sizes = train_loader.batch_sampler.batch_sizes
+    print(f"  batching          : <={RESIDUES_PER_BATCH} residues/batch -> "
+          f"{min(batch_sizes)}-{max(batch_sizes)} proteins (median "
+          f"{int(np.median(batch_sizes))}), {steps_per_epoch} steps/epoch, "
           f"workers {NUM_WORKERS}")
     print(f"  epochs            : {EPOCHS}   total steps {total_steps}")
     print(f"  lr / weight_decay : {LR} / {WEIGHT_DECAY}   warmup {WARMUP_STEPS}")
@@ -471,14 +705,25 @@ def main(smoke_only=False):
     best_val = float("inf")
     start_epoch = 1
     if RESUME_FROM is not None:
-        last_epoch, best_val = load_checkpoint(RESUME_FROM, modules, optimizer,
-                                               scheduler, scaler)
+        last_epoch, best_val, skipped = load_checkpoint(
+            RESUME_FROM, modules, optimizer, scheduler, scaler,
+            allow_arch_mismatch=WARM_START,
+        )
         start_epoch = last_epoch + 1
-        print(f"resumed from {RESUME_FROM}: continuing at epoch {start_epoch} "
-              f"(best val so far {best_val:.3f})")
+        # Batch composition is a function of (seed, epoch); without this a resumed
+        # run would replay epoch 1's batches.
+        train_loader.batch_sampler.set_epoch(start_epoch - 1)
+        if skipped:
+            # Warm start: load_checkpoint dropped the optimizer state and reset the
+            # epoch, so the LR schedule and best-val tracking start clean.
+            print(f"warm-started from {RESUME_FROM}: {len(skipped)} tensor(s) "
+                  f"reinitialised, training from epoch 1 with a fresh schedule.")
+        else:
+            print(f"resumed from {RESUME_FROM}: continuing at epoch {start_epoch} "
+                  f"(best val so far {best_val:.3f})")
 
     # --- catch wiring errors in seconds ------------------------------------
-    smoke_test(modules, train_loader, val_loader)
+    smoke_test(modules, train_loader, val_loader, use_amp, scaler)
     if smoke_only:
         print("--smoke-test: wiring check only, exiting before training.")
         return
@@ -505,7 +750,12 @@ def main(smoke_only=False):
             print(f"  new best val {best_val:.3f} -> saved {CKPT_PREFIX}best.pt")
 
         if epoch % CKPT_EVERY_EPOCHS == 0:
-            path = os.path.join(CKPT_DIR, f"{CKPT_PREFIX}epoch_{epoch:03d}.pt")
+            # Rolling by default: each of these is ~500 MB (weights + optimizer
+            # moments), and only the newest is a useful crash-resume point.
+            # --keep-epoch-ckpts keeps the whole history instead.
+            name = (f"{CKPT_PREFIX}epoch_{epoch:03d}.pt" if KEEP_EPOCH_CKPTS
+                    else f"{CKPT_PREFIX}last.pt")
+            path = os.path.join(CKPT_DIR, name)
             save_checkpoint(path, epoch, modules, optimizer, scheduler, scaler, va_loss)
             print(f"  saved {path}")
 
@@ -514,7 +764,7 @@ def main(smoke_only=False):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Protein JEPA joint training",
+        description="Protein Barlow joint training",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     add_override_args(parser)
@@ -529,8 +779,16 @@ if __name__ == "__main__":
     rn = parser.add_argument_group("run control")
     rn.add_argument("--resume", default=None,
                     help="checkpoint path to continue from (fresh run if omitted)")
+    rn.add_argument("--warm-start", action="store_true", dest="warm_start",
+                    help="allow --resume across an architecture change: keep the "
+                         "weights that still fit, reinitialise the rest, drop the "
+                         "optimizer state and restart the LR schedule")
     rn.add_argument("--ckpt-every", type=int, default=None,
-                    help="also save every N epochs (best.pt is always saved)")
+                    help="also save every N epochs, as a rolling last.pt "
+                         "(best.pt is always saved)")
+    rn.add_argument("--keep-epoch-ckpts", action="store_true", dest="keep_epoch_ckpts",
+                    help="write epoch_NNN.pt every --ckpt-every epochs instead of "
+                         "overwriting one last.pt (~500 MB each)")
     rn.add_argument("--no-amp", action="store_true",
                     help="disable mixed precision and train in full fp32")
     rn.add_argument("--debug", action="store_true",

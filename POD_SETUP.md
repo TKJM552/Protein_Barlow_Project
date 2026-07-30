@@ -93,7 +93,7 @@ or more means you are reading from network storage — move the dataset to `/roo
 ## Train
 
 ```bash
-python train.py --smoke-test        # one train + one val step, asserts grads reach all 4 groups
+python train.py --smoke-test        # one train + one val step, asserts grads reach all 3 groups
 nohup python train.py --num-workers 8 --amp-dtype bf16 --epochs 5 > train.log 2>&1 &
 tail -f train.log
 ```
