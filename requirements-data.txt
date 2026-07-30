@@ -1,8 +1,11 @@
-# Dataset-rebuild dependencies -- ONLY needed to regenerate the training data
-# from scratch via `python get_files.py && python get_inputs_outputs.py`.
+# Dataset-build dependencies -- needed to build the training data with
+# `python get_files.py --build`.
 #
-# processed_dataset/ is committed to this repo, so normal training and eval
-# never import any of these. Skip this file on a GPU pod.
-biopython>=1.81      # get_files.py (PDBList), get_inputs_outputs.py (MMCIFParser)
-requests>=2.31       # get_files.py -- the RCSB search API call
+# INSTALL THESE ON THE POD. This file used to say the opposite ("skip on a GPU
+# pod"), which was true when the 5,000-structure processed_dataset/ was committed
+# to git. At TARGET_STRUCTURES=150,000 the dataset is ~0.5 GB across 150,000
+# files and is built on the machine that trains, so the pod needs these three.
+# Training and eval themselves still import none of them.
+biopython>=1.81      # get_inputs_outputs.py (MMCIFParser), --download-cif (PDBList)
+requests>=2.31       # get_files.py -- the RCSB search API and the structure fetch
 scipy>=1.10          # get_inputs_outputs.py -- cdist for the CA-CA distance matrix

@@ -8,16 +8,27 @@ import warnings
 import numpy as np
 import torch
 import torch.nn as nn
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, Sampler, Subset
 
 # BATCH_SIZE is re-exported here (rather than defined here) so the many existing
 # `from seq_encoder import BATCH_SIZE` imports keep working while the value
 # itself stays overridable via $BATCH_SIZE / --batch-size.
-from config import BATCH_SIZE, DATA_DIR, NUM_WORKERS
+from config import BATCH_SIZE, DATA_DIR, NUM_WORKERS, MIN_RESIDUES
 
 VOCAB_SIZE = 21   # 0 = pad, 1-20 = aa's
 PAD_IDX = 0
 EMBED_DIM = 512
+
+# MIN_RESIDUES -- shortest chain worth training on, re-exported from config (like
+# BATCH_SIZE above) so the many `from seq_encoder import MIN_RESIDUES` imports
+# keep working while the value stays overridable via $MIN_RESIDUES.
+#
+# Why 40: a single residue is one sample with a 1x1 contact map, pure noise that
+# still costs a full slot in a batch, and the old 5,000-structure dataset held 5
+# chains of length 1 and 247 under 40 (5%). 40 is also the floor test_novel.py
+# applies to the structures it pulls from RCSB, so the model is trained and tested
+# on the same length distribution. get_files.py now applies it at BUILD time too,
+# so a fresh dataset contains no sub-40 chains for this to drop.
 
 # --- encoder hyperparameters ---
 N_HEADS = 8
@@ -30,15 +41,21 @@ ROPE_BASE = 10000
 
 class ProteinSequenceDataset(Dataset):
     # .npz file -> (seq_ints 1-D long, contact_map (L,L) float32).
-    # Skip files with zero-length sequences or a map that doesn't match seq length.
+    # Skips sequences shorter than min_residues and maps that don't match seq length.
 
-    def __init__(self, data_dir):
+    def __init__(self, data_dir, min_residues=MIN_RESIDUES):
         self.paths = []
+        # Residue count per item, recorded during the scan that already reads it.
+        # LengthBucketSampler needs every length up front to form batches, and
+        # re-deriving them would mean a second pass over all ~5000 files.
+        self.lengths = []
+        n_short = 0
         for path in sorted(glob.glob(os.path.join(data_dir, "*.npz"))):
             with np.load(path) as data:
                 n = data["seq_ints"].shape[0]
-                if n == 0:
-                    continue  # get rid of empty sequences
+                if n < min_residues:
+                    n_short += 1
+                    continue  # too short to carry structure; see MIN_RESIDUES
                 # seq_ints (length L_i) and contact_map (L_i, L_i) must agree.
                 cmap_shape = tuple(data["contact_map"].shape)
                 if cmap_shape != (n, n):
@@ -48,9 +65,11 @@ class ProteinSequenceDataset(Dataset):
                     )
                     continue
                 self.paths.append(path)
+                self.lengths.append(n)
 
         if not self.paths:
             raise ValueError(f"No usable .npz files found in {data_dir!r}")
+        self.n_skipped_short = n_short
 
     def __len__(self):
         return len(self.paths)
@@ -110,6 +129,122 @@ def make_dataloader(data_dir=DATA_DIR, batch_size=BATCH_SIZE, shuffle=True,
         persistent_workers=num_workers > 0,
     )
 
+
+# ---------------------------------------------------------------------------
+# Length-bucketed batching
+# ---------------------------------------------------------------------------
+def dataset_lengths(ds):
+    """Residue count per item, for a ProteinSequenceDataset or any Subset of one.
+
+    random_split returns Subsets, and --debug wraps the dataset in another one,
+    so this recurses rather than assuming a particular nesting depth.
+    """
+    if isinstance(ds, Subset):
+        parent = dataset_lengths(ds.dataset)
+        return [parent[i] for i in ds.indices]
+    return list(ds.lengths)
+
+
+class LengthBucketSampler(Sampler):
+    """Batch proteins of similar length together, under a total-residue budget.
+
+    collate_pad pads every protein in a batch out to the batch's longest member,
+    so a random batch of 16 drawn from a set whose lengths run 40..990 does most
+    of its work on padding. Measured over this dataset, random batches of 16 do
+    2.41x the useful token work and peak at B*Lmax^2 = 15.7M; bucketing by length
+    under a residue budget brings that to 1.00x and 3.4M -- a 4.6x cut in
+    worst-case attention memory, and ~50% off total training FLOPs.
+
+    Why a RESIDUE budget rather than a fixed protein count: Barlow Twins treats
+    each residue as a sample, and barlow_twins.py needs N > EXPANDER_DIM for the
+    DxD cross-correlation to be well conditioned. Length-bucketing at a fixed 16
+    proteins/batch would put 22% of batches under that bound (N as low as 643) and
+    swing the off_diag floor 21x across batches. A residue budget instead holds N
+    nearly constant -- 0.3% of batches under 2048, floor varying only 4x -- which
+    is *steadier* than the random batching it replaces.
+
+    Batches are re-formed every epoch: lengths are jittered before sorting so
+    near-equal-length proteins swap partners, and the batch ORDER is shuffled so
+    the model does not see all the short chains first.
+    """
+
+    def __init__(self, lengths, residues_per_batch, shuffle=True, seed=0, jitter=8):
+        self.lengths = np.asarray(lengths, dtype=np.int64)
+        if self.lengths.size == 0:
+            raise ValueError("LengthBucketSampler got an empty dataset")
+        longest = int(self.lengths.max())
+        if residues_per_batch < longest:
+            raise ValueError(
+                f"residues_per_batch={residues_per_batch} is below the longest chain "
+                f"({longest}), so that protein could never be placed in a batch. "
+                f"Raise --residues-per-batch to at least {longest}."
+            )
+        self.residues_per_batch = residues_per_batch
+        self.shuffle = shuffle
+        self.seed = seed
+        self.jitter = jitter
+        self.epoch = 0
+        # Jitter changes how proteins pack, so the batch COUNT moves by ~1% between
+        # epochs. len() feeds steps_per_epoch and hence the LR schedule, so the
+        # upcoming epoch's batches are always materialised in advance rather than
+        # having len() report a stale estimate.
+        self._batches = self._epoch_batches()
+
+    def _make_batches(self, order):
+        """Greedily fill batches along a length-sorted ordering.
+
+        A batch closes when adding the next protein would push
+        len(batch) * max_length past the budget -- that product is exactly what
+        collate_pad will materialise, so the budget bounds real memory, not an
+        average.
+        """
+        batches, current, longest = [], [], 0
+        for idx in order:
+            length = int(self.lengths[idx])
+            candidate = max(longest, length)
+            if current and (len(current) + 1) * candidate > self.residues_per_batch:
+                batches.append(current)
+                current, longest = [], 0
+                candidate = length
+            current.append(int(idx))
+            longest = candidate
+        if current:
+            batches.append(current)
+        return batches
+
+    def _epoch_batches(self):
+        """The batches for self.epoch. Deterministic in (seed, epoch)."""
+        if not self.shuffle:
+            return self._make_batches(np.argsort(self.lengths, kind="stable"))
+        rng = np.random.default_rng([self.seed, self.epoch])
+        # Jitter before sorting so near-equal-length proteins swap partners between
+        # epochs; without it every batch would be frozen for the whole run.
+        keys = self.lengths + rng.uniform(0.0, self.jitter, size=self.lengths.size)
+        batches = self._make_batches(np.argsort(keys, kind="stable"))
+        rng.shuffle(batches)      # don't feed the model all the short chains first
+        return batches
+
+    def set_epoch(self, epoch):
+        """Jump to a given epoch's batches -- call this when resuming a run."""
+        self.epoch = epoch
+        self._batches = self._epoch_batches()
+
+    @property
+    def batch_sizes(self):
+        """Protein count per batch for the UPCOMING epoch.
+
+        For reporting. Iterating the sampler to count would advance it to the
+        next epoch, so read this instead.
+        """
+        return [len(b) for b in self._batches]
+
+    def __len__(self):
+        return len(self._batches)
+
+    def __iter__(self):
+        yield from self._batches
+        if self.shuffle:
+            self.set_epoch(self.epoch + 1)   # keeps len() exact for the next epoch
 
 
 class TokenEmbedding(nn.Module):
@@ -212,12 +347,20 @@ class MultiHeadSelfAttention(nn.Module):
         return x.view(B, L, self.n_heads, self.head_dim).transpose(1, 2)
 
     def forward(self, x, mask):
-        """x: (B, L, E). mask is one of two forms:
-          * (B, L) bool  -> key-padding mask, True = real key (sequence encoder).
-          * (B, 1, L, L) float -> additive per-(i,j) mask, 0 = allowed, large
-            negative = disallowed (contact-map encoder). Broadcasts over heads.
+        """x: (B, L, E). mask is BOOL in both forms, True = attend here:
+          * (B, L)       -> key-padding mask, True = real key (sequence encoder).
+          * (B, 1, L, L) -> per-(i, j) mask (contact-map encoder). Broadcasts
+            over heads.
+
+        Both forms go through the same masked_fill. Keeping the mask boolean
+        rather than a float additive matters under AMP: adding an fp32 mask to
+        fp16 scores promotes the whole (B, H, L, L) score tensor to fp32, which
+        silently doubles attention memory and discards the AMP speedup on every
+        block that uses it.
         """
         B, L, _ = x.shape
+        assert mask.dtype == torch.bool, (
+            f"attention mask must be bool (True = attend), got {mask.dtype}")
 
         q = self._split_heads(self.q_proj(x), B, L)
         k = self._split_heads(self.k_proj(x), B, L)
@@ -231,11 +374,8 @@ class MultiHeadSelfAttention(nn.Module):
         # Masking (the ONE spot that differs between the two encoders). Masked
         # positions get a large finite negative (finfo.min, NOT -inf, to avoid
         # NaNs from softmax on an all-masked row). Bidirectional -> no causal mask.
-        if mask.dtype == torch.bool:
-            key_mask = mask.view(B, 1, 1, L)                         # True = real key
-            scores = scores.masked_fill(~key_mask, torch.finfo(scores.dtype).min)
-        else:
-            scores = scores + mask                                   # (B, 1, L, L), broadcasts over heads
+        allowed = mask.view(B, 1, 1, L) if mask.dim() == 2 else mask
+        scores = scores.masked_fill(~allowed, torch.finfo(scores.dtype).min)
 
         attn = torch.softmax(scores, dim=-1)
         attn = self.attn_dropout(attn)

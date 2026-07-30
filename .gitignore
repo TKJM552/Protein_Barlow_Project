@@ -1,5 +1,6 @@
 # --- large data / artifacts -------------------------------------------------
-# Raw RCSB downloads: ~3.9 GB of .cif. Regenerate with `python get_files.py`.
+# Raw RCSB downloads. Only the legacy `get_files.py --download-cif` path writes
+# here at all -- the default build streams and keeps nothing.
 pdb_dataset/
 
 # Checkpoints: ~500 MB EACH (43M params x fp32 x model+optimizer+scheduler).
@@ -8,9 +9,16 @@ checkpoints/
 *.pt
 *.pth
 
-# NOTE: processed_dataset/ is deliberately NOT ignored. It is the actual training
-# input (~23 MB of .npz) and is committed so a fresh GPU pod can train straight
-# after `git clone`, with no 3.9 GB re-download from RCSB.
+# The built dataset. At TARGET_STRUCTURES=150,000 this is ~150,000 files and
+# ~0.6 GB, so it is no longer shippable in git the way the old 5,000 (23 MB) was.
+# What IS committed is pdb_ids.txt -- the ~1 MB list of PDB IDs the build works
+# from -- so a pod reproduces the identical dataset with:
+#     python get_files.py --build
+#
+# The 4,966 .npz already tracked here stay tracked (an ignore rule does not untrack
+# anything), which is deliberate: they are a ready-made smoke-test dataset after a
+# bare clone. This rule only stops `git add .` from committing a 150,000-file build.
+processed_dataset/
 
 # --- python -----------------------------------------------------------------
 __pycache__/
@@ -33,6 +41,9 @@ env/
 *.log
 runs/
 wandb/
+
+# Per-ID skip reasons from `get_files.py --build`. Regenerated every build.
+build_failures.txt
 
 # Structures downloaded on demand by test_novel.py
 novel_cache/

@@ -1,7 +1,7 @@
 """Pull proteins the model has NEVER seen from RCSB, and test them end to end.
 
-Everything in eval.py runs on the 4,966 structures the model was trained on --
-even the held-out val split came from the same query and the same era of the PDB.
+Everything in eval.py runs on the structures the model was trained on -- even the
+held-out val split came from the same query and the same era of the PDB.
 This fetches structures that are not in the dataset at all, processes them
 through the exact training pipeline, and reports how the two branches compare.
 
@@ -28,8 +28,9 @@ import torch
 import torch.nn.functional as F
 
 import train
-from seq_encoder import ProteinSequenceDataset
-from compare_embeddings import embed, pooled
+from map_encoder import MAX_LEN
+from seq_encoder import ProteinSequenceDataset, MIN_RESIDUES
+from compare_embeddings import embed, embed_map
 from eval import linear_cka, CMP_LEN
 
 RCSB_SEARCH = "https://search.rcsb.org/rcsbsearch/v2/query"
@@ -68,7 +69,7 @@ def candidate_ids(n_wanted, exclude, rng):
                     "operator": "exact_match", "value": "Protein"}},
                 {"type": "terminal", "service": "text", "parameters": {
                     "attribute": "entity_poly.rcsb_sample_sequence_length",
-                    "operator": "less_or_equal", "value": 1000}},
+                    "operator": "less_or_equal", "value": MAX_LEN}},
             ],
         },
         "return_type": "entry",
@@ -103,7 +104,7 @@ def fetch_cif(pdb_id, cache_dir):
     return path
 
 
-def analyse(modules, random_modules, seq_ints, cmap, control_targets, device,
+def analyse(modules, random_modules, seq_ints, cmap, control_maps, device,
             cmp_len=CMP_LEN):
     """One novel protein -> the numbers that matter.
 
@@ -117,20 +118,20 @@ def analyse(modules, random_modules, seq_ints, cmap, control_targets, device,
     the true structure. Everything here is truncated to exactly `n` residues,
     and controls shorter than that are skipped.
     """
-    pred, target = embed(modules, seq_ints, cmap, device)
-    r_pred, r_target = embed(random_modules, seq_ints, cmap, device)
-    pred = pred.float(); target = target.float()
+    z_seq, z_map = embed(modules, seq_ints, cmap, device)
+    r_seq, r_map = embed(random_modules, seq_ints, cmap, device)
+    z_seq = z_seq.float(); z_map = z_map.float()
 
     # Reported CKA uses the whole protein (no ranking involved, so no truncation).
-    cka_full = linear_cka(pred, target)
-    cka_rand = linear_cka(r_pred.float(), r_target.float())
-    per_res = float(F.cosine_similarity(pred, target, dim=-1).mean())
+    cka_full = linear_cka(z_seq, z_map)
+    cka_rand = linear_cka(r_seq.float(), r_map.float())
+    per_res = float(F.cosine_similarity(z_seq, z_map, dim=-1).mean())
 
     # Ranking: fixed length, like for like.
-    n = min(pred.shape[0], cmp_len)
-    usable = [t for t in control_targets if t.shape[0] >= n]
-    matched = linear_cka(pred[:n], target[:n])
-    ctrl = np.array([linear_cka(pred[:n], t[:n]) for t in usable])
+    n = min(z_seq.shape[0], cmp_len)
+    usable = [t for t in control_maps if t.shape[0] >= n]
+    matched = linear_cka(z_seq[:n], z_map[:n])
+    ctrl = np.array([linear_cka(z_seq[:n], t[:n]) for t in usable])
     rank = int((ctrl >= matched).sum()) + 1       # 1 = its own structure wins
     pct = 100.0 * float((matched > ctrl).mean())
     return cka_full, cka_rand, per_res, rank, pct, len(usable)
@@ -154,6 +155,10 @@ def main():
     device = train.DEVICE
     ckpt = args.ckpt or os.path.join(train.CKPT_DIR, "best.pt")
 
+    # Only clean up a cache directory this run created. Without this, pointing
+    # --cache-dir at an existing directory would delete it and everything in it.
+    cache_is_ours = not os.path.isdir(args.cache_dir)
+
     # No --seed -> a genuinely different draw every run.
     seed = args.seed if args.seed is not None else int.from_bytes(os.urandom(4), "big")
     rng = np.random.default_rng(seed)
@@ -167,7 +172,14 @@ def main():
 
     # --- models: the trained one, plus an untrained control ---------------
     modules = train.build_modules()
-    epoch, val_loss = train.load_checkpoint(ckpt, modules)
+    epoch, val_loss, skipped = train.load_checkpoint(ckpt, modules)
+    if skipped:
+        # The whole point of this script is CKA between the sequence branch and the
+        # MAP branch on unseen structures. A reinitialised tensor in either branch
+        # turns that into a measurement of random weights.
+        sys.exit(f"refusing to run: {len(skipped)} tensor(s) in '{ckpt}' do not match "
+                 f"the current architecture (listed above). Retrain, or use a "
+                 f"checkpoint from this architecture.")
     train.set_seed(999)
     random_modules = train.build_modules()
     for M in (modules, random_modules):
@@ -176,11 +188,13 @@ def main():
     print(f"checkpoint : {ckpt}  (epoch {epoch}, val_loss {val_loss:.3f})")
     print(f"device     : {device}")
 
-    # --- controls: residue-level targets from the training dataset ---------
+    # --- controls: residue-level z_map from the training dataset -----------
+    # Structure branch only: these are decoys ranked against a novel protein's
+    # z_seq, so their own z_seq was computed and discarded.
     ds = ProteinSequenceDataset(train.DATA_DIR)
     ctrl_idx = rng.choice(len(ds), min(args.n_controls, len(ds)), replace=False)
-    control_targets = [embed(modules, *ds[int(i)], device)[1].float() for i in ctrl_idx]
-    print(f"controls   : {len(control_targets)} dataset proteins to rank against\n")
+    control_maps = [embed_map(modules, ds[int(i)][1], device).float() for i in ctrl_idx]
+    print(f"controls   : {len(control_maps)} dataset proteins to rank against\n")
 
     # --- pick the novel structures ----------------------------------------
     seen = known_ids(train.DATA_DIR)
@@ -212,17 +226,22 @@ def main():
             continue
         _, seq_ints, contact_map = result
         L = len(seq_ints)
-        if L < 40 or L > 1000:          # same bounds the training data respects
+        # Exactly the bounds the training data respects, both imported rather than
+        # written out: MIN_RESIDUES is the dataset's own floor, and MAX_LEN is the
+        # number of columns the map encoder's seed projection has -- a longer chain
+        # would trip its assert, not merely be atypical.
+        if L < MIN_RESIDUES or L > MAX_LEN:
             continue
         s = torch.as_tensor(seq_ints, dtype=torch.long)
         c = torch.as_tensor(contact_map, dtype=torch.float32)
         cka, cka_rand, per_res, rank, pct, n_used = analyse(
-            modules, random_modules, s, c, control_targets, device)
+            modules, random_modules, s, c, control_maps, device)
         rows.append((pid, L, cka, cka_rand, per_res, rank, pct, n_used))
         print(f"{pid:<7}{L:>5}{cka:>8.3f}{cka_rand:>9.3f}{per_res:>9.3f}"
               f"{rank:>5}/{n_used + 1}{pct:>7.1f}%")
 
-    if not args.keep and not args.pdb_id:
+    cleaned = cache_is_ours and not args.keep and not args.pdb_id
+    if cleaned:
         shutil.rmtree(args.cache_dir, ignore_errors=True)
 
     if not rows:
@@ -252,8 +271,10 @@ def main():
     mean_ctrl = float(np.mean([r[7] for r in rows]))
     print(f"  -> Own structure ranked #1 for {n_first}/{len(rows)} proteins "
           f"(chance {100/(mean_ctrl+1):.1f}%).")
-    if not args.keep and not args.pdb_id:
+    if cleaned:
         print(f"\n  ({args.cache_dir} deleted; pass --keep to retain downloads)")
+    elif not cache_is_ours:
+        print(f"\n  ({args.cache_dir} already existed, so it was left alone)")
 
 
 if __name__ == "__main__":
