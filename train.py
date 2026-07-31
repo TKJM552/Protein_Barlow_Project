@@ -43,6 +43,7 @@ from seq_encoder import (
 )
 from map_encoder import ContactMapEncoder
 from barlow_twins import BarlowTwinsLoss
+from config import read_clusters
 
 import config
 
@@ -266,6 +267,72 @@ def set_seed(seed):
 # ---------------------------------------------------------------------------
 # Data
 # ---------------------------------------------------------------------------
+SPLIT_N_CLUSTERS = None    # set by split_by_cluster; None = random fallback
+
+
+def dataset_pdb_ids(ds):
+    """PDB id per item, for a ProteinSequenceDataset or any Subset of one.
+
+    Recurses like dataset_lengths, for the same reason: --debug wraps the
+    dataset in a Subset before the split ever happens.
+    """
+    if isinstance(ds, Subset):
+        parent = dataset_pdb_ids(ds.dataset)
+        return [parent[i] for i in ds.indices]
+    return [os.path.splitext(os.path.basename(p))[0].lower() for p in ds.paths]
+
+
+def split_by_cluster(full):
+    """Train/val split that keeps each SEQUENCE CLUSTER wholly on one side.
+
+    A random split leaks badly, because the PDB deposits the same protein many
+    times over. Measured on the committed 4,966-structure dataset: 40.3% of val
+    chains had their exact sequence in train and 73.9% had a near-twin, so val
+    loss was substantially measuring memorisation -- and best.pt is selected on
+    val loss. Grouping by RCSB's 30%-identity clusters takes that to 0.8% / 6.4%.
+
+    Falls back to the old random split, loudly, when pdb_clusters.txt is absent,
+    so a fresh clone still runs -- it just runs with the leak.
+    """
+    global SPLIT_N_CLUSTERS
+    clusters = read_clusters()
+    ids = dataset_pdb_ids(full)
+    if not clusters:
+        print("WARNING: no pdb_clusters.txt -- falling back to a RANDOM split, "
+              "in which ~40% of val proteins also appear in train. Run "
+              "`python get_files.py --clusters` to fix this.")
+        n_val = int(VAL_FRACTION * len(full))
+        gen = torch.Generator().manual_seed(SEED)
+        return random_split(full, [len(full) - n_val, n_val], generator=gen)
+
+    # Anything unlisted becomes its own group: conservative, since a singleton
+    # can never pull a homologue across the split.
+    groups = {}
+    for i, pid in enumerate(ids):
+        groups.setdefault(clusters.get(pid, f"solo:{pid}"), []).append(i)
+
+    # Shuffle whole clusters, then fill val until the quota is met. Clusters are
+    # uneven (the largest holds 146 of the committed 4,966), so val lands near
+    # VAL_FRACTION rather than exactly on it.
+    keys = sorted(groups)
+    random.Random(SEED).shuffle(keys)
+
+    target = int(VAL_FRACTION * len(ids))
+    val_idx = []
+    for k in keys:
+        if len(val_idx) >= target:
+            break
+        val_idx.extend(groups[k])
+
+    held = set(val_idx)
+    train_idx = [i for i in range(len(ids)) if i not in held]
+    SPLIT_N_CLUSTERS = len(groups)
+    print(f"split by sequence cluster: {len(groups):,} clusters -> "
+          f"{len(train_idx):,} train / {len(val_idx):,} val "
+          f"(no cluster spans both)")
+    return Subset(full, train_idx), Subset(full, val_idx)
+
+
 def build_loaders():
     """Train/val loaders, both batched by residue budget rather than protein count.
 
@@ -283,11 +350,8 @@ def build_loaders():
     # the capped set. The split logic below is otherwise unchanged.
     if DEBUG_MAX_PROTEINS is not None:
         full = Subset(full, range(min(DEBUG_MAX_PROTEINS, len(full))))
-    n_total = len(full)
-    n_val = int(VAL_FRACTION * n_total)
-    n_train = n_total - n_val
-    gen = torch.Generator().manual_seed(SEED)
-    train_set, val_set = random_split(full, [n_train, n_val], generator=gen)
+    train_set, val_set = split_by_cluster(full)
+    n_train, n_val = len(train_set), len(val_set)
 
     # pin_memory only helps (and is only valid) for CUDA host->device copies.
     # persistent_workers keeps the worker pool alive across all EPOCHS instead of
@@ -666,7 +730,12 @@ def _split_fingerprint():
     compare_embeddings.py has to re-derive it to say whether a protein was held
     out, and reading SEED off the checkpoint beats assuming the default was used.
     """
-    return {"seed": SEED, "val_fraction": VAL_FRACTION, "min_residues": MIN_RESIDUES}
+    return {"seed": SEED, "val_fraction": VAL_FRACTION, "min_residues": MIN_RESIDUES,
+            # A cluster-grouped val loss and a random one are not comparable --
+            # the random one is inflated by homologues shared with train -- so a
+            # checkpoint has to say which it was measured against.
+            "grouped_by_cluster": SPLIT_N_CLUSTERS is not None,
+            "n_clusters": SPLIT_N_CLUSTERS}
 
 
 def save_checkpoint(path, epoch, modules, optimizer, scheduler, scaler, val_loss):

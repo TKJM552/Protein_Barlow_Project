@@ -71,11 +71,27 @@ it is built from). Build it onto **local disk**:
 pip install -r requirements-data.txt        # biopython, requests, scipy
 export DATA_DIR=/root/processed_dataset     # NOT /workspace -- see above
 
-nohup python get_files.py --build --workers 16 > build.log 2>&1 &
+nohup python get_files.py --build --workers 16 --max-per-cluster 5 > build.log 2>&1 &
 tail -f build.log
 ```
 
-Expect **2–5 hours**. It streams gzipped mmCIF from RCSB, writes one `.npz` per
+**Use `--max-per-cluster 5`.** The 154,500-ID list is **7.2× redundant**: it
+covers only **21,561 distinct proteins** at 30% sequence identity, and the top
+1,000 clusters supply 48.5% of all structures while 7,986 clusters supply exactly
+one. Building all of it downloads the same protein up to a thousand times and
+then trains on that imbalance.
+
+| cap | structures built | clusters kept |
+|---|---|---|
+| none | 154,463 | 21,561 |
+| **5** | **59,161** | **21,561** |
+| 10 | 79,369 | 21,561 |
+
+A cap of 5 keeps **every** cluster at 2.6× less build time and 2.6× faster
+epochs. It needs `pdb_clusters.txt`, which is committed — regenerate with
+`python get_files.py --clusters` only if you want a different identity threshold.
+
+Uncapped, expect **2–5 hours**. It streams gzipped mmCIF from RCSB, writes one `.npz` per
 structure, and keeps no `.cif` — ~0.5 GB lands on disk instead of ~118 GB, so the
 30 GB pod is fine. Progress lines report `built / target`, rate, and an ETA.
 
@@ -170,6 +186,28 @@ So anything up around 0.1+ and climbing means the shortcut is forming: kill the
 run rather than pay for the remaining epochs. Read the trend, not one value — it
 is biased upward by about (cells / residues) and is not comparable across
 different bin counts.
+
+## The train/val split is grouped by sequence cluster
+
+The banner prints `split by sequence cluster: N clusters -> ... (no cluster spans
+both)`. If instead you see a **WARNING** about a random split, `pdb_clusters.txt`
+is missing — run `python get_files.py --clusters`.
+
+This matters more than it sounds. The PDB deposits the same protein repeatedly as
+mutants, ligand complexes and better resolutions, so a random split puts identical
+chains on both sides. Measured on the committed 4,966-structure dataset:
+
+| split | val chains with an exact sequence twin in train | with a near-twin |
+|---|---|---|
+| random | **40.3%** | 73.9% |
+| grouped by 30% identity | **0.8%** | 4.4% |
+
+Two in five validation proteins were literally in the training set, so val loss
+was substantially measuring memorisation — and `best.pt` is selected on val loss.
+
+Because of this, **val losses from before this change are not comparable** to
+ones after it; the old numbers are optimistic. Checkpoints record which split
+they used under `split.grouped_by_cluster`.
 
 ## The position-centering ablation
 

@@ -156,6 +156,30 @@ def amp_dtype(name=None):
     return _AMP_DTYPES[key]
 
 
+CLUSTER_LIST = os.environ.get("CLUSTER_LIST", "./pdb_clusters.txt")
+
+
+def read_clusters(path=None):
+    """{pdb_id: cluster_id} for the grouped train/val split, {} if absent.
+
+    Lives here rather than in get_files.py so that training does not import
+    `requests`: a GPU pod installs requirements.txt (torch + numpy) only, and
+    requirements-data.txt is needed just to REBUILD the dataset. Writing the file
+    is get_files.py's job (`--clusters`); reading it is everyone's.
+    """
+    path = path or CLUSTER_LIST
+    if not os.path.exists(path):
+        return {}
+    mapping = {}
+    with open(path) as fh:
+        for line in fh:
+            if line.startswith("#") or not line.strip():
+                continue
+            pid, _, cid = line.partition(" ")
+            mapping[pid.strip().lower()] = int(cid)
+    return mapping
+
+
 def resolve_device(requested=None):
     """Return a torch.device: CLI flag wins, then $DEVICE, then cuda-if-available.
 

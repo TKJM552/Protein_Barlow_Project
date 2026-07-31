@@ -27,6 +27,7 @@ Requires the extras in requirements-data.txt (biopython, requests, scipy).
 """
 
 import argparse
+import collections
 import gzip
 import io
 import os
@@ -37,6 +38,8 @@ from concurrent.futures import ProcessPoolExecutor
 import requests
 
 from config import (
+    CLUSTER_LIST,
+    read_clusters,
     DATA_DIR,
     FETCH_WORKERS,
     ID_LIST,
@@ -241,6 +244,91 @@ def read_ids(path=ID_LIST):
 
 
 # ---------------------------------------------------------------------------
+# Sequence clusters -- what keeps homologues out of the validation split
+# ---------------------------------------------------------------------------
+# The PDB is highly redundant: the same protein is deposited over and over as
+# mutants, ligand complexes and better resolutions. Measured on the committed
+# 4,966-structure dataset, 40.5% of files sit in a byte-identical-sequence group
+# and the largest such group holds 127 copies. A RANDOM train/val split then puts
+# identical proteins on both sides -- 40.3% of val chains had their exact
+# sequence in train, and 73.9% had a near-twin -- so val loss largely measures
+# memorisation, and best.pt is selected on it.
+#
+# RCSB publishes precomputed clusters, so nothing has to be aligned locally.
+# Grouping the split by 30%-identity cluster takes that 40.3% / 73.9% down to
+# 0.8% / 6.4% (the remainder is the entity approximation below).
+CLUSTER_URL = ("https://cdn.rcsb.org/resources/sequence/clusters/"
+               "clusters-by-entity-{identity}.txt")
+
+
+def fetch_clusters(identity=30, extra_ids=()):
+    """Download RCSB's cluster file and reduce it to the IDs we actually use.
+
+    The published file is ~22 MB of every entity in the PDB; what train.py needs
+    is one small line per structure, so this trims it to the ID list (plus
+    `extra_ids`, which is how already-built .npz files that predate the current
+    list still get a cluster).
+
+    A PDB entry can hold several entities in different clusters. We take the
+    LOWEST-numbered polymer entity, which is normally the main chain and so
+    normally the one get_files.py keeps -- an approximation, and the reason a
+    residual ~0.8% of exact twins survives the grouped split. Recording the kept
+    chain at build time would close that gap.
+    """
+    url = CLUSTER_URL.format(identity=identity)
+    print(f"Downloading {url} ...")
+    resp = requests.get(url, timeout=300)
+    resp.raise_for_status()
+
+    best_entity, raw_cluster = {}, {}
+    for line_no, line in enumerate(resp.text.splitlines()):
+        for token in line.split():
+            pdb, _, entity = token.partition("_")
+            pdb = pdb.lower()
+            try:
+                entity = int(entity)
+            except ValueError:
+                continue
+            if pdb not in best_entity or entity < best_entity[pdb]:
+                best_entity[pdb] = entity
+                raw_cluster[pdb] = line_no
+    print(f"  parsed {len(raw_cluster):,} PDB entries")
+
+    wanted = list(dict.fromkeys(list(read_ids()) + list(extra_ids)))
+    missing = [i for i in wanted if i not in raw_cluster]
+
+    # Renumber densely over the IDs we keep, so the file does not depend on
+    # RCSB's line ordering. Anything RCSB does not list becomes its own cluster:
+    # conservative, since a singleton can never drag a homologue across the split.
+    dense, out = {}, {}
+    for pid in wanted:
+        raw = raw_cluster.get(pid, ("solo", pid))
+        if raw not in dense:
+            dense[raw] = len(dense)
+        out[pid] = dense[raw]
+
+    print(f"  {len(wanted):,} IDs -> {len(dense):,} clusters "
+          f"({len(missing):,} unlisted by RCSB, kept as singletons)")
+    return out, identity
+
+
+def write_clusters(mapping, identity, path=CLUSTER_LIST):
+    with open(path, "w") as fh:
+        fh.write(f"# PDB id -> sequence-cluster id, for the grouped train/val "
+                 f"split in train.py.\n")
+        fh.write(f"# Source: {CLUSTER_URL.format(identity=identity)}\n")
+        fh.write(f"# Threshold: {identity}% sequence identity. Regenerate with "
+                 f"`python get_files.py --clusters`.\n")
+        fh.write(f"# Cluster ids are renumbered densely over these IDs -- they "
+                 f"are NOT RCSB line numbers.\n")
+        fh.write(f"#identity {identity}\n")
+        for pid, cid in sorted(mapping.items()):
+            fh.write(f"{pid} {cid}\n")
+    print(f"Wrote {len(mapping):,} assignments to '{path}' "
+          f"({os.path.getsize(path)/1e6:.1f} MB)")
+
+
+# ---------------------------------------------------------------------------
 # Stage 2 -- fetch + process, keeping nothing
 # ---------------------------------------------------------------------------
 # One requests.Session per worker PROCESS, created in the initializer: it keeps
@@ -315,10 +403,46 @@ def _fetch_and_process(job):
     return pdb_id, "ok", ""
 
 
+def cap_per_cluster(ids, max_per_cluster, already=()):
+    """Keep at most `max_per_cluster` structures from each sequence cluster.
+
+    The ID list is 7.2x redundant at 30% identity -- 154,463 structures across
+    only 21,561 clusters -- and the redundancy is lopsided: the top 1,000
+    clusters supply 48.5% of all structures, while 7,986 clusters supply exactly
+    one. Building all of it means downloading the same protein a thousand times
+    and then training on that imbalance.
+
+    Capping keeps every cluster while cutting the volume: cap 5 gives 59,161
+    structures with the SAME 21,561 clusters, so ~2.6x less build time and 2.6x
+    faster epochs at no cost in diversity.
+
+    IDs already on disk count toward their cluster's quota, so a resumed build
+    does not re-cap differently and start hoarding.
+    """
+    mapping = read_clusters()
+    if not mapping:
+        print("  (no pdb_clusters.txt -- run `--clusters` first; not capping)")
+        return ids
+
+    seen = collections.Counter(mapping.get(i, -1) for i in already)
+    kept = []
+    for pid in ids:
+        cid = mapping.get(pid)
+        if cid is None:                 # unlisted: treat as its own cluster
+            kept.append(pid)
+            continue
+        if seen[cid] < max_per_cluster:
+            seen[cid] += 1
+            kept.append(pid)
+    print(f"  cluster cap {max_per_cluster}: {len(ids):,} -> {len(kept):,} IDs "
+          f"across {len({mapping.get(i) for i in kept}):,} clusters")
+    return kept
+
+
 def stream_build(ids, out_dir=DATA_DIR, target=TARGET_STRUCTURES,
                  workers=FETCH_WORKERS, dist_threshold=8.0,
                  max_length=MAX_SEQ_LENGTH, min_length=MIN_RESIDUES,
-                 failure_log=FAILURE_LOG):
+                 failure_log=FAILURE_LOG, max_per_cluster=None):
     """Turn a list of PDB IDs into out_dir/*.npz, without keeping any mmCIF.
 
     Stops as soon as out_dir holds `target` structures, so the overfetch margin
@@ -331,6 +455,9 @@ def stream_build(ids, out_dir=DATA_DIR, target=TARGET_STRUCTURES,
     have = {os.path.splitext(f)[0] for f in os.listdir(out_dir)
             if f.endswith(".npz")}
     todo = [i for i in ids if i not in have]
+
+    if max_per_cluster:
+        todo = cap_per_cluster(todo, max_per_cluster, already=have)
     print(f"{len(have):,} structures already in '{out_dir}', "
           f"{len(todo):,} of {len(ids):,} IDs left to fetch, "
           f"target {target:,}")
@@ -449,6 +576,17 @@ def parse_args(argv=None):
     parser.add_argument("--target", type=int, default=TARGET_STRUCTURES,
                         help=f"structures to build (env: TARGET_STRUCTURES, "
                              f"default {TARGET_STRUCTURES:,})")
+    parser.add_argument("--clusters", action="store_true",
+                        help="download RCSB sequence clusters and write "
+                             f"'{CLUSTER_LIST}'. train.py uses it to keep "
+                             "homologues out of the validation split")
+    parser.add_argument("--cluster-identity", type=int, default=30,
+                        choices=[30, 40, 50, 70, 90, 95, 100],
+                        help="sequence-identity threshold for --clusters")
+    parser.add_argument("--max-per-cluster", type=int, default=None,
+                        help="build at most N structures per sequence cluster. "
+                             "The ID list is 7.2x redundant, so N=5 keeps every "
+                             "cluster at ~2.6x less build time. Needs --clusters")
     parser.add_argument("--ids-file", default=ID_LIST,
                         help=f"where the ID list lives (env: ID_LIST, "
                              f"default {ID_LIST})")
@@ -478,7 +616,7 @@ def main(argv=None):
 
     # --build/--download-cif reuse a committed ID list if there is one, so the
     # pod and this machine work from the identical set of structures.
-    need_ids = args.ids or not (args.build or args.download_cif)
+    need_ids = args.ids or not (args.build or args.download_cif or args.clusters)
     if not need_ids and not os.path.exists(args.ids_file):
         print(f"No '{args.ids_file}' -- querying RCSB for one first.")
         need_ids = True
@@ -491,9 +629,23 @@ def main(argv=None):
         ids = read_ids(args.ids_file)
         print(f"Read {len(ids):,} IDs from '{args.ids_file}'")
 
+    if args.clusters:
+        # Structures already built may predate the current ID list, so they are
+        # folded in explicitly -- otherwise they would land in the split with no
+        # cluster and be treated as singletons.
+        built = []
+        if os.path.isdir(args.data_dir):
+            built = [os.path.splitext(f)[0].lower()
+                     for f in os.listdir(args.data_dir) if f.endswith(".npz")]
+        mapping, identity = fetch_clusters(args.cluster_identity, extra_ids=built)
+        write_clusters(mapping, identity)
+        if not args.build:
+            return
+
     if args.build:
         stream_build(ids, args.data_dir, args.target, args.workers,
-                     max_length=args.max_length, min_length=args.min_length)
+                     max_length=args.max_length, min_length=args.min_length,
+                     max_per_cluster=args.max_per_cluster)
     elif args.download_cif:
         download_structures(ids, PDB_DIR)
     else:
