@@ -105,9 +105,20 @@ SEED = 0
 #
 # The removed part is not lost, it is factored out: z = m[index] + deviation,
 # and m is a population average -- something you MEASURE, not something gradient
-# descent has to learn. Run with --no-position-centering for the B arm of the
-# ablation that checks it costs no real information (see POD_SETUP.md).
-POSITION_CENTERING = True
+# descent has to learn.
+#
+# DEFAULT OFF, DELIBERATELY. The shortcut is argued for above but has never been
+# OBSERVED in this model -- untrained z_seq sits at free = 0.018 against a 0.005
+# noise floor, and no run with the current architecture has finished.
+# Turning the fix on by default would mean never finding out whether it was
+# needed, and it is not free: it removes real population-level chemistry
+# (terminal charge, end-of-chain disorder) along with the shortcut.
+#
+# So the default run is the BASELINE. Watch `free` in the epoch line: if it
+# climbs past ~0.05 the shortcut is forming, and --position-centering is the fix
+# to re-run with. If it stays near 0.01, the fix was never needed and the run you
+# already have is the model. See POD_SETUP.md.
+POSITION_CENTERING = False
 MIN_PROTEINS_PER_INDEX = 2   # an index held by one protein centres to exactly
                              # zero, so those residues leave the loss instead of
                              # entering the statistics as fake all-zero samples
@@ -121,11 +132,16 @@ MIN_PROTEINS_PER_INDEX = 2   # an index held by one protein centres to exactly
 # length-normalised shortcut f(index/length), which per-index centring does not
 # fully remove.
 #
-# HIGH is bad. Read the TREND: biased upward by roughly (cells / residues),
-# ~0.004 here, so it separates 0.03 from 0.6 and is not to be quoted to three
-# decimals or compared across different bin counts. Same small-sample trap
-# FINDINGS.md records for CKA. For scale, map_encoder.py measured z_map at random
-# init at 0.033 with the relative seed.
+# HIGH is bad. Read the TREND: biased upward by roughly (cells / residues), which
+# for the shipped settings is 192/37,246 = 0.005 -- and random input measures
+# 0.005, so the bias estimate is sound. It separates 0.02 from 0.6; it is not to
+# be quoted to three decimals or compared across different bin counts. Same
+# small-sample trap FINDINGS.md records for CKA.
+#
+# Calibration, all measured on the val split's probe:
+#     random noise            0.005   (the estimator's own floor)
+#     untrained z_seq         0.018   (where a run starts)
+#     purely positional z     0.994   (total collapse)
 PROBE_PROTEINS = 192       # held-out chains, strided across the length range
 PROBE_CHUNK = 16           # padded together at a time, to cap probe memory
 N_FRAC_BINS = 24
@@ -184,8 +200,8 @@ def apply_cli_overrides(args):
         WARM_START = True
     if getattr(args, "keep_epoch_ckpts", False):
         KEEP_EPOCH_CKPTS = True
-    if getattr(args, "no_position_centering", False):
-        POSITION_CENTERING = False
+    if getattr(args, "position_centering", False):
+        POSITION_CENTERING = True
 
     config.amp_dtype(AMP_DTYPE)   # validate the dtype now, not 500 steps in
 
@@ -958,7 +974,8 @@ def main(smoke_only=False):
           f"workers {NUM_WORKERS}")
     print(f"  epochs            : {EPOCHS}   total steps {total_steps}")
     print(f"  lr / weight_decay : {LR} / {WEIGHT_DECAY}   warmup {WARMUP_STEPS}")
-    print(f"  position centring : {'ON' if POSITION_CENTERING else 'OFF (ablation B)'}")
+    print(f"  position centring : "
+          f"{'ON' if POSITION_CENTERING else 'OFF (baseline -- watch `free`)'}")
     print(f"  grad clip / amp   : {GRAD_CLIP} / "
           f"{AMP_DTYPE if use_amp else 'off (fp32)'}"
           f"{'' if not use_amp else ' (scaler ' + ('on' if scaler.is_enabled() else 'off') + ')'}")
@@ -1068,11 +1085,12 @@ if __name__ == "__main__":
                          "overwriting one last.pt (~500 MB each)")
     rn.add_argument("--no-amp", action="store_true",
                     help="disable mixed precision and train in full fp32")
-    rn.add_argument("--no-position-centering", action="store_true",
-                    dest="no_position_centering",
-                    help="do NOT subtract the per-index mean before the loss. "
-                         "This is the B arm of the ablation -- it restores the "
-                         "positional shortcut, so expect `free` to climb")
+    rn.add_argument("--position-centering", action="store_true",
+                    dest="position_centering",
+                    help="subtract the per-index mean before the loss, which "
+                         "makes a purely positional representation worth exactly "
+                         "zero. OFF by default: run the baseline first, and turn "
+                         "this on if `free` shows the shortcut actually forming")
     rn.add_argument("--debug", action="store_true",
                     help="fast GPU-free pass over a tiny subset (cpu, 20 proteins, "
                          "2 epochs, batch 4) to catch shape/mask/wiring bugs")

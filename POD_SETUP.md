@@ -178,9 +178,9 @@ Reference points, measured:
 
 | | `free` |
 |---|---|
-| random noise (the estimator's own floor) | 0.004 |
-| untrained `z_seq` | 0.006 |
-| a purely positional representation | 0.99 |
+| random noise (the estimator's own floor) | 0.005 |
+| **untrained `z_seq` — where your run starts** | **0.018** |
+| a purely positional representation | 0.994 |
 
 So anything up around 0.1+ and climbing means the shortcut is forming: kill the
 run rather than pay for the remaining epochs. Read the trend, not one value — it
@@ -209,45 +209,60 @@ Because of this, **val losses from before this change are not comparable** to
 ones after it; the old numbers are optimistic. Checkpoints record which split
 they used under `split.grouped_by_cluster`.
 
-## The position-centering ablation
+## Baseline first, fix only if needed
 
-`train.py` subtracts the per-index mean before the loss, which makes a purely
-positional representation worth exactly zero (verified: it centres to 0.0000).
-The open question is whether that also costs real information. Run both arms
-**on the small 4,966-structure dataset committed to the repo** — an epoch is ~1
-minute there versus ~35 at 150k, so the whole thing is under an hour:
+**The positional shortcut is argued for but has never been observed in this
+model.** Untrained `z_seq` sits at `free = 0.018` against a 0.005 noise
+floor, and no run with the current architecture has finished. So the default run
+applies **no fix** — it is the measurement.
+
+The fix (`--position-centering`) subtracts the per-index mean before the loss,
+which makes a purely positional representation worth exactly zero — verified, it
+centres to 0.0000. But it is not free: it also removes real population-level
+chemistry, since terminal charge and end-of-chain disorder are shared by every
+protein at that index. Turning it on by default would mean never learning whether
+it was needed.
+
+**Step 1 — run the baseline and watch `free`.** Do it on the committed
+4,966-structure dataset first: no build required, and a training step costs the
+same whatever the dataset size, so nothing is saved by waiting for 150k.
 
 ```bash
 unset DATA_DIR                      # use the committed processed_dataset/
-python train.py --epochs 10 --seed 0 --ckpt-dir ./ck_A
-python train.py --epochs 10 --seed 0 --ckpt-dir ./ck_B --no-position-centering
+python train.py --epochs 10 --seed 0 --ckpt-dir ./ck_base
 ```
 
-Same `--seed`, so the split and batch order are identical and the only
-difference is the change. Then compare:
+**Step 2 — read the `free` column, from epoch 1.** You do not need the run to
+finish:
+
+- stays around **0.02**, where it starts → no shortcut. The fix was never needed and this run is
+  your model. Go straight to the 150k build.
+- climbs past **~0.05** and keeps rising → the shortcut is forming. Kill the run
+  at epoch 3–5 rather than paying for the rest.
+
+A single elevated value is not the signal; the trend across epochs is.
+
+**Step 3 — only if it climbed**, re-run with the fix and compare:
 
 ```bash
-python eval.py --test probe     --ckpt ./ck_A/best.pt    # and ck_B
-python eval.py --test retrieval --ckpt ./ck_A/best.pt
-python eval.py --test alignment --ckpt ./ck_A/best.pt
+python train.py --epochs 10 --seed 0 --ckpt-dir ./ck_fix --position-centering
+python eval.py --test probe --ckpt ./ck_base/best.pt     # and ck_fix
 ```
 
-**Decision rule.** TEST 5 (`probe`) is the one that matters — it asks whether the
-frozen encoder still contains contact information, which is the direct test of
-"was anything important lost".
+Same `--seed`, so the split and batch order are identical and the only difference
+is the change. TEST 5 (`probe`) is the arbiter — it asks whether the frozen
+encoder still contains contact information, which is the direct test of "did the
+fix cost me anything real". If `probe` holds and `free` drops, take the fix to
+the 150k run.
 
-- probe holds within noise, A's `free` much lower than B's → centering is a free
-  win; take it to the 150k run
-- probe drops materially in A → it cost real information, and you know that in
-  under an hour instead of after a day of GPU time
-
-Two caveats. 4,966 structures is not 150,000, so this screens the *mechanism*,
-not the final numbers. And `eval.py` does not itself centre: with centering on,
-the component of `z` along the per-index mean gets no gradient, so it is
-unconstrained noise in the tests that mix indices (`retrieval`, `alignment`).
-That biases the comparison **against** arm A, so a positive result for A is
-trustworthy; an A-looks-worse result on those two specifically is the confound,
-not a finding, and `probe` is the tiebreak.
+Two caveats if you get that far. 4,966 structures is not 150,000, so this screens
+the *mechanism*, not the final numbers — and keep watching `free` during the real
+run, since shortcut emergence is the part that genuinely does not transfer. And
+`eval.py` does not itself centre: with centering on, the component of `z` along
+the per-index mean gets no gradient, so it is unconstrained noise in the tests
+that mix indices (`retrieval`, `alignment`). That biases the comparison
+**against** the fix, so a win for it is trustworthy; a loss on those two
+specifically is the confound, not a finding, and `probe` is the tiebreak.
 
 ## Before terminating
 
