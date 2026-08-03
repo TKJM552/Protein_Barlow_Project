@@ -909,8 +909,14 @@ def load_checkpoint(source, modules, optimizer=None, scheduler=None, scaler=None
     # these is correct, but it is still an architecture mismatch and must be
     # reported as one, not silently ignored.
     for name in ckpt:
+        # NOTE: every non-module key save_checkpoint writes must be listed here,
+        # or it gets reported as a deleted module and the load is treated as an
+        # architecture mismatch -- which discards the epoch/val_loss metadata and
+        # prints a PARTIAL LOAD warning about weights that were in fact fine.
+        # `position_centered` was missed when it was added and did exactly that.
         if name in MODULE_KEYS or name in ("epoch", "val_loss", "arch", "split",
-                                           "optimizer", "scheduler", "scaler"):
+                                           "optimizer", "scheduler", "scaler",
+                                           "position_centered"):
             continue
         skipped.append(f"{name}.*: module no longer exists, discarded")
 
