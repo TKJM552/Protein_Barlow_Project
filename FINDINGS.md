@@ -19,6 +19,8 @@ Written down because none of it is derivable from the code or git history.
 | Batching | length-bucketed, ≤4096 residues/batch, 283 steps/epoch |
 | First full run | 2026-08-03, 50 epochs, 4090, bf16, `--seed 0`, no positional fix |
 | Best checkpoint | **epoch 17**, val 562.167 (val loss rises after that) |
+| Centering arm | same seed/epochs with `--position-centering`; best **epoch 9**, val 1071.370 |
+| Verdict | centering **prevents** the shortcut (`free` 0.172 → 0.065) at no measured cost |
 
 ---
 
@@ -75,6 +77,78 @@ than either alone:
 reads 0.009 untrained and 1.000 for a position-only encoder. Where they disagree,
 trust `free`: a permuted chain is not a protein, so `shuf` asks the encoder about
 an input unlike anything it trained on.
+
+---
+
+## The centering arm: it PREVENTS the shortcut, and costs nothing
+
+Same seed, same 50 epochs, same data, `--position-centering` the only difference.
+
+**1. `free` never rises.**
+
+| epoch | 1 | 3 | 6 | 9 | 20 | 50 |
+|---|---|---|---|---|---|---|
+| baseline | 0.043 | 0.187 | **0.250** | 0.250 | 0.208 | 0.172 |
+| centered | 0.045 | 0.059 | 0.067 | 0.063 | 0.073 | **0.065** |
+
+Flat at 0.06–0.07 for all fifty epochs. The baseline's climb to a quarter of the
+representation by epoch 6 simply does not happen. This is **prevention, not
+suppression** — worth knowing, because it means the fix does not depend on the
+shortcut forming first and being pushed back out.
+
+**2. It costs nothing measurable.** TEST 5, long-range contacts, on each arm's
+`best.pt`:
+
+| | P@L/5 | AUC |
+|---|---|---|
+| baseline (epoch 17) | 0.050 | 0.609 |
+| centered (epoch 9) | **0.053** | **0.611** |
+| random encoder | 0.033 | 0.565 |
+| distance-only | 0.026 | 0.760 |
+
+Slightly *better*, not worse. The concern that removing the per-index mean would
+take real chemistry with it is not supported: nothing the contact probe can see
+was lost.
+
+**3. It does not fix the overfitting**, and was never going to. At epoch 50 both
+arms sit at a **42×** train/val `on_diag` gap. That is a dataset-size problem —
+1,547 distinct proteins against 43M parameters — and it is what scaling to 21,561
+clusters is for.
+
+### DO NOT compare val loss between the arms
+
+Baseline best val is 562.167; the centered arm's is 1071.370. **This does not mean
+the fix made the model worse.**
+
+The centered run computes its val loss *with centering applied*. Centering removes
+the positional component of agreement, which mechanically lowers every `c_ii` and
+so raises `on_diag`. It is a stricter objective by construction — a different
+quantity, not a worse score on the same one.
+
+The only cross-arm comparisons that mean anything are **`free`** and **TEST 5**,
+because both are computed identically in both arms on the frozen encoder. Both
+favour centering.
+
+### What is still unexplained
+
+- `free` settles at **0.065**, not at the 0.018 an untrained encoder gives. So
+  centering does not drive positional content to zero. It removes position from
+  the conditional MEAN — exactly and provably — and whatever remains is outside
+  the mean, i.e. nonlinear or higher-moment. A trained adversarial probe is the
+  only instrument that would resolve it; nothing here says it is worth building.
+- The encoder is weak in absolute terms. **`distance-only` gets AUC 0.760 against
+  the encoder's 0.611** — a trivial "near in sequence = near in space" prior still
+  wins on global ranking. The encoder beats it on P@L/5 (0.053 vs 0.026), the
+  field-standard metric, so "trained > distance-only" holds on one measure and
+  fails on the other. It has learned something real and modest, not something
+  strong.
+- Best val arrives at **epoch 9** with centering versus **epoch 17** without, so
+  the centered arm starts overfitting sooner. Unexplained; possibly just noise in
+  a val set of 473 chains.
+
+**Decision: run the 150k build with `--position-centering`.** It prevents the
+shortcut at no measured cost, and the open question — whether the shortcut
+re-emerges at 14× the diversity — is the one thing this dataset cannot answer.
 
 ---
 
