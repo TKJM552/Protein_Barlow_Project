@@ -52,7 +52,10 @@ builds its scaler with `torch.amp.GradScaler(device=...)`, which does not exist
 in 2.2. The run would die at startup, *after* the slow dataset scan.
 
 ```bash
-python -c "import torch; assert torch.__version__ >= '2.3', torch.__version__"
+# Compares numerically, on purpose: a string compare puts '2.10' BELOW '2.3' and
+# would send you into a needless `pip install -U torch`, which is the command most
+# likely to swap the CUDA build for a CPU-only wheel. Also strips the +cu121 suffix.
+python -c "import torch; v=tuple(map(int, torch.__version__.split('+')[0].split('.')[:2])); assert v >= (2,3), torch.__version__; print('torch', torch.__version__, 'OK')"
 ```
 
 If the template is older, upgrade from the CUDA index so you keep a GPU wheel —
