@@ -644,13 +644,55 @@ def representational_alignment(modules, seed, n_prot=15):
 
 
 # ===========================================================================
+# TEST 7 -- positional shortcut
+# ===========================================================================
+def positional_shortcut(modules, seed=0):
+    """Is the representation a positional lookup table rather than chemistry?
+
+    Both numbers are computed by train.py so the epoch-line values and these are
+    the same quantity, and both answer the same question by different routes:
+
+      free -- fraction of z_seq's variance explained by (fractional position,
+              chain length) alone. A variance decomposition; nothing is fitted.
+      shuf -- how much of z_seq survives permuting the amino acids within each
+              chain. Whatever survives was computed without reading identity.
+
+    They should roughly agree. Where they disagree, `free` is the more trustworthy
+    of the two: a shuffled chain is not a protein, so `shuf` asks the encoder about
+    an input unlike anything it trained on.
+    """
+    hr("TEST 7  positional_shortcut  -- is z_seq mostly just position?")
+    # The probe MUST come from the val split, exactly as train.py builds it.
+    # Built from the whole dataset instead, the cell occupancy differs and so does
+    # the estimator's bias -- the same model reads 0.006 one way and 0.018 the
+    # other, and the numbers would not be comparable to the training log's.
+    _, val_loader, _, _ = train.build_loaders()
+    probe = train.build_probe(val_loader.dataset)
+    if probe is None:
+        print("  dataset too small to bin honestly -- skipped.")
+        return
+
+    free = train.free_information(modules, probe)
+    shuf = train.shuffle_invariance(modules, probe)
+    print(f"  free (variance from position+length alone) : {free:.3f}")
+    print(f"  shuf (survives amino-acid permutation)     : {shuf:.3f}")
+    print( "\n  Reference points, measured on this dataset:")
+    print( "    0.005  the free estimator's own noise floor")
+    print( "    0.018  an UNTRAINED encoder")
+    print( "    0.994  a purely positional representation")
+    print( "\n  HIGH is bad -- it is the share of the representation obtained")
+    print( "  without reading any chemistry. Retrain with --position-centering")
+    print( "  to make a positional solution worth exactly zero to the loss.")
+
+
+# ===========================================================================
 # CLI
 # ===========================================================================
 def main():
     ap = argparse.ArgumentParser(description="Protein Barlow diagnostics")
     ap.add_argument("--test", required=True,
                     choices=["overfit", "shuffled", "collapse", "retrieval", "probe",
-                             "alignment", "all"])
+                             "alignment", "shortcut", "all"])
     ap.add_argument("--ckpt", default=None, help="checkpoint path (default: random init)")
     ap.add_argument("--seed", type=int, default=0)
     train.add_override_args(ap)   # --data-dir / --ckpt-dir / --device / --batch-size / ...
@@ -685,6 +727,9 @@ def main():
     if t in ("alignment", "all"):
         m, _ = build_setup(ckpt, args.seed)
         representational_alignment(m, seed=args.seed)
+    if t in ("shortcut", "all"):
+        m, _ = build_setup(ckpt, args.seed)
+        positional_shortcut(m, seed=args.seed)
 
 
 if __name__ == "__main__":

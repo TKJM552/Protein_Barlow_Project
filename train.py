@@ -668,6 +668,60 @@ def _cell_ids(mask):
 
 
 @torch.no_grad()
+def shuffle_invariance(modules, probe):
+    """How much of z_seq survives PERMUTING the amino acids within each chain.
+
+    Length, padding and every residue's index are untouched -- only which amino
+    acid sits where changes. So whatever survives is, by construction, the part
+    the encoder computed WITHOUT reading residue identity.
+
+    Returns a mean-centred per-residue cosine, which is roughly the same quantity
+    free_information() estimates: if z = p + c with p the identity-independent
+    part and c the identity-dependent part, then shuffling replaces c with an
+    independent c' and the cosine lands near |p|^2/|z|^2. Reaching it by a
+    completely different route is the point -- agreement between the two is worth
+    more than either alone. HIGH is bad; ~1.0 means identity is being ignored.
+
+    CAVEAT, and it is why this is a cross-check rather than the primary metric:
+    a permuted chain is NOT a protein. It has no real secondary-structure
+    propensities and no valid local motifs, so the encoder is being asked about an
+    input unlike anything it trained on, and a reassuring number here could be an
+    artefact of it simply not knowing what to do with nonsense.
+
+    The permutation is drawn from a fixed seed, so the number moves between epochs
+    only because the model did.
+    """
+    set_mode(modules, train=False)
+    encoder = modules["sequence_encoder"]
+    gen = torch.Generator(device="cpu").manual_seed(SEED)
+
+    num = sq_a = sq_b = 0.0
+    for ints, mask in probe:
+        lengths = mask.sum(1)
+        # build_probe pads at the END, so the real residues are a prefix and the
+        # permutation only has to cover [0, length).
+        perm = torch.arange(ints.shape[1]).repeat(ints.shape[0], 1)
+        for b, n in enumerate(lengths.tolist()):
+            perm[b, :n] = torch.randperm(n, generator=gen)
+        shuffled = ints.gather(1, perm.to(ints.device))
+
+        z = encoder(ints, mask)[0].float()[mask]
+        z_s = encoder(shuffled, mask)[0].float()[mask]
+        # Centre both on the SAME grand mean: a shared constant offset would
+        # otherwise inflate every cosine toward 1 regardless of content.
+        grand = z.mean(0, keepdim=True)
+        z, z_s = z - grand, z_s - grand
+
+        num += (z * z_s).sum().item()
+        sq_a += z.pow(2).sum().item()
+        sq_b += z_s.pow(2).sum().item()
+
+    # Pooled cosine: sum<z, z'> / sqrt(sum|z|^2 * sum|z'|^2). Steadier than
+    # averaging per-residue cosines, which lets near-zero-norm residues dominate.
+    return num / max(1e-12, math.sqrt(sq_a * sq_b))
+
+
+@torch.no_grad()
 def free_information(modules, probe):
     """Fraction of z_seq's variance explained by (fractional position, length).
 
@@ -1029,10 +1083,12 @@ def main(smoke_only=False):
         # A climbing `free` is the signal to kill the run -- note best.pt below
         # is still selected on val loss, which cannot see this.
         free = free_information(modules, probe) if probe else None
+        shuf = shuffle_invariance(modules, probe) if probe else None
 
         print(f"epoch {epoch:3d} | train {tr_loss:.3f} (on {tr_on:.3f}, off {tr_off:.1f}) "
               f"| val {va_loss:.3f} (on {va_on:.3f}, off {va_off:.1f})"
-              + (f" | free {free:.3f}" if free is not None else ""))
+              + (f" | free {free:.3f}" if free is not None else "")
+              + (f" | shuf {shuf:.3f}" if shuf is not None else ""))
 
         is_best = va_loss < best_val
         if is_best:

@@ -9,20 +9,72 @@ Written down because none of it is derivable from the code or git history.
 
 ---
 
-## Status: nothing has been trained yet
-
-The current architecture has **never completed a training run.** Every number
-below comes from static analysis or an untrained model. Do not quote any of it as
-a result.
+## Status: first run complete — it trains, and it takes the shortcut
 
 | | |
 |---|---|
 | Architecture | 2 encoders + Barlow Twins, no prediction head |
 | Parameters | 43.1M — sequence encoder 18.9M, map encoder 13.6M, expanders 10.5M |
-| Training set | 4,719 chains of 4,966 (`MIN_RESIDUES = 40` drops 247) |
-| Batching | length-bucketed, ≤4096 residues/batch, 286 steps/epoch |
-| Last full run | none (the 50-epoch run in the archive used a different model) |
-| Checkpoints | none valid; `checkpoints/best.pt` predates both changes |
+| Training set | 4,246 train / 473 val, from **1,547 sequence clusters** |
+| Batching | length-bucketed, ≤4096 residues/batch, 283 steps/epoch |
+| First full run | 2026-08-03, 50 epochs, 4090, bf16, `--seed 0`, no positional fix |
+| Best checkpoint | **epoch 17**, val 562.167 (val loss rises after that) |
+
+---
+
+## The first run: three findings
+
+**1. It trains.** `on_diag` — which sits at ~2048 when the two branches agree on
+nothing — fell to **13.1** on train. The sequence and contact-map views do learn
+to agree. That was not established before this run.
+
+**2. It overfits badly.** Train and validation diverge from about epoch 17:
+
+| | epoch 17 | epoch 50 |
+|---|---|---|
+| train `on_diag` | 52 | **13** |
+| val `on_diag` | 400 | **545** |
+
+Best val loss is 562.167 at epoch 17; by epoch 50 it is back to 661. A 40×
+train/val gap is memorisation, which is what a 43M-parameter model does to 1,547
+distinct proteins. **This is the run's biggest problem, and it is a dataset-size
+problem, not a loss problem** — scaling to the 21,561 clusters in `pdb_ids.txt`
+is what addresses it. Nothing about the positional fix touches it.
+
+**3. The positional shortcut is real, and it plateaus rather than running away.**
+`free` (share of `z_seq` reproducible from position and chain length alone):
+
+| epoch | 1 | 3 | 6 | 17 | 50 |
+|---|---|---|---|---|---|
+| `free` | 0.043 | 0.187 | **0.250** | 0.229 | **0.172** |
+
+Against 0.018 untrained and a 0.005 noise floor. So it rises fast for ~6 epochs,
+peaks at a quarter of the representation, then falls back and settles near a
+sixth for the last ten epochs.
+
+That shape is the finding. Position is picked up early as a scaffold and is
+*partly* displaced as real chemistry is learned — but it stalls, and ~17% of the
+representation is still obtainable without reading any chemistry at the end of
+training. It is neither the total collapse the argument feared nor absent.
+
+Note `best.pt` is chosen on val loss, so it is epoch 17, where `free` is **0.229**
+— *higher* than the epoch-50 model. Selecting on val loss actively prefers the
+more positional checkpoint.
+
+### Reading the two shortcut metrics
+
+Both are printed every epoch and both are also in `eval.py --test shortcut`.
+They answer the same question by different routes, so agreement is worth more
+than either alone:
+
+| | 0.005 | 0.018 | 0.994 |
+|---|---|---|---|
+| `free` | estimator's noise floor | untrained encoder | purely positional |
+
+`shuf` — how much of `z_seq` survives permuting the amino acids within a chain —
+reads 0.009 untrained and 1.000 for a position-only encoder. Where they disagree,
+trust `free`: a permuted chain is not a protein, so `shuf` asks the encoder about
+an input unlike anything it trained on.
 
 ---
 
