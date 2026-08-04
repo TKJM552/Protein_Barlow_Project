@@ -1,7 +1,11 @@
 # Running this on a RunPod GPU
 
-The sequence that actually worked, including the two things that cost the most
-time on the first attempt.
+The sequence that actually worked, including the things that cost the most time
+on the first attempt.
+
+This is now the **full-scale runbook**: the whole 154,500-structure PDB set, with
+`--position-centering` on. The small-dataset baseline it replaces is finished and
+written up in [FINDINGS.md](FINDINGS.md) — do not redo it.
 
 ## The one non-obvious thing
 
@@ -10,18 +14,24 @@ network-backed. Constructing the dataset from it — then 4,966 small `.npz` fil
 took **over 5 minutes**, versus ~1 second on local disk. Training re-reads those
 files every epoch, so it throttles the whole run, not just startup.
 
-At **150,000 files** that same 300× penalty turns a ~40-second startup scan into
-roughly **2.5 hours, every single invocation**. This is no longer a nuisance; it
-makes the dataset size unusable. Build to `/root` (local NVMe) and write only
-checkpoints to `/workspace`. `/root` is wiped on pod restart, but re-cloning takes
-30 seconds and rebuilding is resumable.
+At **154,500 files** that same 300× penalty turns a ~40-second startup scan into
+hours, **every single invocation**. This is no longer a nuisance; it makes the
+dataset size unusable. Build to `/root` (local NVMe) and write only checkpoints to
+`/workspace`. `/root` is wiped on pod restart, but re-cloning takes 30 seconds and
+rebuilding is resumable.
 
 ## Setup
 
-Deploy with a **PyTorch template**, ~30 GB persistent storage (checkpoints are
-~500 MB each; the default run keeps `best.pt` plus a rolling `last.pt`, so ~1 GB).
-Container disk needs ~5 GB free for the dataset (~0.5 GB) plus the image.
-Then, in the web terminal:
+Deploy an **RTX 4090** with a **PyTorch template**, ~30 GB persistent storage and
+~20 GB container disk.
+
+Storage is not the constraint. The builder streams gzipped mmCIF and keeps only a
+small `.npz` per structure, so the complete 154,500-structure dataset is **0.43 GB**
+— it never touches the ~118 GB the raw `.cif` files would take. The 30 GB volume is
+for checkpoints, which are ~500 MB each (the run keeps `best.pt` plus a rolling
+`last.pt`).
+
+Everything below runs in RunPod's **web terminal** (Connect → Start Web Terminal).
 
 > **Repo name.** The project is now *Protein Barlow*, but the GitHub remote is
 > still `Protein_JEPA_Project` until it is renamed in the repo settings. The clone
@@ -67,45 +77,70 @@ pip install -U torch --index-url https://download.pytorch.org/whl/cu121   # matc
 
 ## Build the dataset
 
-The 150,000-structure dataset is not in git (only `pdb_ids.txt`, the 154,500 IDs
-it is built from). Build it onto **local disk**:
+The dataset is not in git (only `pdb_ids.txt`, the 154,500 IDs it is built from).
+Build it onto **local disk**:
 
 ```bash
 pip install -r requirements-data.txt        # biopython, requests, scipy
 export DATA_DIR=/root/processed_dataset     # NOT /workspace -- see above
 
-nohup python get_files.py --build --workers 16 --max-per-cluster 5 > build.log 2>&1 &
+nohup python get_files.py --build --workers 16 > build.log 2>&1 &
 tail -f build.log
 ```
 
-**Use `--max-per-cluster 5`.** The 154,500-ID list is **7.2× redundant**: it
-covers only **21,561 distinct proteins** at 30% sequence identity, and the top
-1,000 clusters supply 48.5% of all structures while 7,986 clusters supply exactly
-one. Building all of it downloads the same protein up to a thousand times and
-then trains on that imbalance.
+No `--target` and no `--max-per-cluster`: the defaults already aim at the full
+150,000, and this run is deliberately uncapped. `Ctrl+C` stops the `tail`, not the
+build.
 
-| cap | structures built | clusters kept |
-|---|---|---|
-| none | 154,463 | 21,561 |
-| **5** | **59,161** | **21,561** |
-| 10 | 79,369 | 21,561 |
+Expect **2–5 hours**. Progress lines report `built / target`, rate, and an ETA.
 
-A cap of 5 keeps **every** cluster at 2.6× less build time and 2.6× faster
-epochs. It needs `pdb_clusters.txt`, which is committed — regenerate with
-`python get_files.py --clusters` only if you want a different identity threshold.
+### Why uncapped, and what capping would have bought
 
-Uncapped, expect **2–5 hours**. It streams gzipped mmCIF from RCSB, writes one `.npz` per
-structure, and keeps no `.cif` — ~0.5 GB lands on disk instead of ~118 GB, so the
-30 GB pod is fine. Progress lines report `built / target`, rate, and an ETA.
+`--max-per-cluster N` keeps at most N structures per 30%-identity sequence cluster.
+It is worth understanding what it does and does not change:
+
+| cap | structures built | **clusters kept** | disk | steps/epoch |
+|---|---|---|---|---|
+| 1 | 21,598 | 21,598 | 0.06 G | ~1,230 |
+| 5 | 59,198 | 21,598 | 0.17 G | ~3,373 |
+| 10 | 79,406 | 21,598 | 0.22 G | ~4,525 |
+| 20 | 98,831 | 21,598 | 0.28 G | ~5,632 |
+| **none** | **154,500** | **21,598** | **0.43 G** | **~8,800** |
+
+**Every cap yields the same 21,598 distinct proteins.** The ID list is 7.2×
+redundant — the PDB deposits the same protein repeatedly as point mutants, ligand
+complexes, alternative conformations and better resolutions — so the cap only
+changes how many near-duplicates of each family you get, never how many families.
+
+Two real considerations, pulling opposite ways:
+
+- **Against uncapped:** the redundancy is lopsided. The top 1,000 clusters supply
+  **48.5%** of all structures while **8,023** clusters supply exactly one, so
+  uncapped the model spends about half its time on 5% of the families.
+- **For uncapped:** those duplicates are not identical. Different conformations and
+  crystal forms of the same protein give genuinely different contact maps, which is
+  natural augmentation working *against* memorisation — and memorisation is this
+  model's measured failure (a 42× train/val gap, see FINDINGS).
+
+Compute is **not** a reason to cap, as long as you compare at fixed gradient steps
+rather than fixed epochs. At ~132,000 steps, uncapped gets 15 passes over 154,500
+structures and `--max-per-cluster 5` gets 40 passes over 59,198 — same GPU hours,
+and more distinct data is the better shape for an overfitting problem. Disk is
+irrelevant at every setting. The only genuine extra cost of uncapped is a longer
+build (2–5 h rather than 1–2 h).
+
+Capping needs `pdb_clusters.txt`, which is committed; regenerate with
+`python get_files.py --clusters` only for a different identity threshold.
+
+### Checks while it runs
 
 It is safe to interrupt. Every `.npz` is written atomically (temp file + rename),
-and a re-run skips IDs that already have one, so the same command resumes. Sanity
-checks worth 20 seconds before walking away:
+and a re-run skips IDs that already have one, so the same command resumes.
 
 ```bash
 head -3 build.log                            # should say "0 structures already in ..."
-ls /root/processed_dataset | wc -l            # climbing
-du -sh /root/processed_dataset                # ~3 KB per structure
+ls /root/processed_dataset | wc -l           # climbing
+du -sh /root/processed_dataset               # ~3 KB per structure, heading for ~0.43 G
 ls /root/Protein_Barlow_Project/pdb_dataset 2>/dev/null | wc -l   # must stay 0/absent
 ```
 
@@ -120,49 +155,77 @@ trap):
 time python -c "import train,seq_encoder; seq_encoder.ProteinSequenceDataset(train.DATA_DIR)"
 ```
 
-`real` should be **~40 seconds** for 150,000 files on local disk. Several minutes
+`real` should be **~40 seconds** for 154,500 files on local disk. Several minutes
 or more means you are reading from network storage — move the dataset to `/root`.
 
 ## Train
 
 ```bash
 python train.py --smoke-test        # one train + one val step, asserts grads reach all 3 groups
-nohup python train.py --num-workers 8 --amp-dtype bf16 --epochs 5 > train.log 2>&1 &
+
+nohup python train.py --amp-dtype bf16 --num-workers 8 --seed 0 \
+      --position-centering --epochs 15 > train.log 2>&1 &
 tail -f train.log
 ```
-
-**`--epochs` matters now.** `EPOCHS = 50` was tuned when an epoch was 286 steps.
-At 150,000 structures an epoch is ~9,640 steps (~35 min on a 4090), so the default
-is ~480,000 steps and about a day of GPU time. `--epochs 5` is already 2.4× the
-total gradient steps of the archived 50-epoch run — start there and read the val
-curve. Confirm the banner before it commits: it prints `steps/epoch` and
-`total steps` up front.
 
 `nohup ... &` is what keeps training alive when the browser tab closes. Without
 it, closing the terminal kills the run. `Ctrl+C` stops the `tail`, not the training.
 
-- `--amp-dtype bf16` on Ampere or newer (A100, A10, L4, H100, 30xx/40xx/50xx).
+Before it commits, the banner prints `steps/epoch` and `total steps` — expect
+**~8,800** and **~132,000**, about 32 min/epoch on a 4090 and ~8 hours total. It
+also prints `split by sequence cluster: N clusters`; a **WARNING** about a random
+split instead means `pdb_clusters.txt` is missing.
+
+Why each flag:
+
+- **`--position-centering` — on, not off.** This is the change from the earlier
+  runbook. The shortcut was argued for, then measured: baseline `free` climbed
+  0.043 → 0.250 by epoch 6, while the centered arm stayed flat at 0.06–0.07 for all
+  fifty epochs, at no measured cost to contact prediction (P@L/5 0.050 → 0.053).
+  The baseline question is answered; there is no reason to pay for it twice.
+- **`--epochs 15`.** The cosine LR schedule anneals to zero at exactly this number,
+  so it is locked in at launch. Resuming later with a different `--epochs` puts a
+  discontinuity in the LR, and a `best.pt` taken from a longer schedule is
+  un-annealed and slightly degraded. `EPOCHS = 50` in config was tuned when an
+  epoch was 286 steps; at ~8,800 it would be ~440,000 steps and well over a day.
+- **`--amp-dtype bf16`** on Ampere or newer (A100, A10, L4, H100, 30xx/40xx/50xx).
   Omit it on V100/T4 to use the fp16 default — that is now safe. The Barlow Twins
   loss is computed in fp32 regardless of `--amp-dtype`, because `off_diag` runs to
   ~90,000 in the first epochs and fp16 caps at 65,504. Before that fix an fp16 run
   produced `inf`, skipped every optimizer step, and reported only
   `WARNING: frequent skips!`.
-- If you hit CUDA OOM, add `--residues-per-batch 2048` (**not** `--batch-size`,
-  which only affects `eval.py` now). Batches are length-bucketed and close at
-  `proteins x longest chain <= the budget`, so that number is the padded width
-  directly — halving it halves peak activation memory. Stay above ~2048: Barlow
-  Twins treats each residue as a sample and wants more of them than
-  `EXPANDER_DIM = 2048` per batch.
+- **`--seed 0`** pins the train/val split and the batch order.
+
+If you hit CUDA OOM, add `--residues-per-batch 2048` (**not** `--batch-size`,
+which only affects `eval.py` now). Batches are length-bucketed and close at
+`proteins x longest chain <= the budget`, so that number is the padded width
+directly — halving it halves peak activation memory. Stay above ~2048: Barlow
+Twins treats each residue as a sample and wants more of them than
+`EXPANDER_DIM = 2048` per batch.
 
 Checking back after a disconnect:
 
 ```bash
-pgrep -af train.py                              # 1 trainer + 16 workers = healthy
+pgrep -af train.py                              # 1 trainer + 8 workers = healthy
 tail -20 /root/Protein_Barlow_Project/train.log
 nvidia-smi                                      # GPU-Util should be high
 ```
 
-Watch for `WARNING: frequent skips!` — that means non-finite losses.
+Three things to watch in the epoch lines:
+
+| column | healthy | bad |
+|---|---|---|
+| `free` | flat, ~0.02–0.07 | climbing past 0.1 — centering is not holding |
+| val `on_diag` | falling | rising for 3+ epochs — past the useful point |
+| `WARNING: frequent skips!` | absent | present — non-finite losses |
+
+You do not have to stop the moment val turns. `best.pt` tracks the best val epoch
+throughout, so overshooting costs GPU time and nothing else.
+
+**Val loss from this run is not comparable to the archived baseline's numbers.**
+With centering on, the model scores itself with the positional component of
+agreement removed, which mechanically raises `on_diag`. It is a stricter objective,
+not a worse model. See FINDINGS.
 
 ## The `free` column
 
@@ -182,13 +245,15 @@ Reference points, measured:
 | | `free` |
 |---|---|
 | random noise (the estimator's own floor) | 0.005 |
-| **untrained `z_seq` — where your run starts** | **0.018** |
+| untrained `z_seq` | 0.018 |
+| **centered 50-epoch run, every epoch** | **0.06–0.07** |
+| uncentered 50-epoch run, peak at epoch 6 | 0.250 |
 | a purely positional representation | 0.994 |
 
-So anything up around 0.1+ and climbing means the shortcut is forming: kill the
-run rather than pay for the remaining epochs. Read the trend, not one value — it
-is biased upward by about (cells / residues) and is not comparable across
-different bin counts.
+With `--position-centering` on, anything climbing past ~0.1 means centering is not
+containing it at this scale, which would itself be the finding — that is the open
+question this run exists to answer. Read the trend, not one value: it is biased
+upward by about (cells / residues) and is not comparable across different bin counts.
 
 ## The train/val split is grouped by sequence cluster
 
@@ -198,7 +263,7 @@ is missing — run `python get_files.py --clusters`.
 
 This matters more than it sounds. The PDB deposits the same protein repeatedly as
 mutants, ligand complexes and better resolutions, so a random split puts identical
-chains on both sides. Measured on the committed 4,966-structure dataset:
+chains on both sides. Measured on the 4,966-structure dataset:
 
 | split | val chains with an exact sequence twin in train | with a near-twin |
 |---|---|---|
@@ -207,65 +272,31 @@ chains on both sides. Measured on the committed 4,966-structure dataset:
 
 Two in five validation proteins were literally in the training set, so val loss
 was substantially measuring memorisation — and `best.pt` is selected on val loss.
+Uncapped, the redundancy is 7.2× rather than 3×, so this matters *more* here, not
+less.
 
 Because of this, **val losses from before this change are not comparable** to
 ones after it; the old numbers are optimistic. Checkpoints record which split
 they used under `split.grouped_by_cluster`.
 
-## Baseline first, fix only if needed
-
-**The positional shortcut is argued for but has never been observed in this
-model.** Untrained `z_seq` sits at `free = 0.018` against a 0.005 noise
-floor, and no run with the current architecture has finished. So the default run
-applies **no fix** — it is the measurement.
-
-The fix (`--position-centering`) subtracts the per-index mean before the loss,
-which makes a purely positional representation worth exactly zero — verified, it
-centres to 0.0000. But it is not free: it also removes real population-level
-chemistry, since terminal charge and end-of-chain disorder are shared by every
-protein at that index. Turning it on by default would mean never learning whether
-it was needed.
-
-**Step 1 — run the baseline and watch `free`.** Do it on the committed
-4,966-structure dataset first: no build required, and a training step costs the
-same whatever the dataset size, so nothing is saved by waiting for 150k.
+## Evaluate before terminating
 
 ```bash
-unset DATA_DIR                      # use the committed processed_dataset/
-python train.py --epochs 10 --seed 0 --ckpt-dir ./ck_base
+python eval.py --test probe    --ckpt /workspace/checkpoints/best.pt
+python eval.py --test shortcut --ckpt /workspace/checkpoints/best.pt
+python eval.py --test shuffled --ckpt /workspace/checkpoints/best.pt
 ```
 
-**Step 2 — read the `free` column, from epoch 1.** You do not need the run to
-finish:
+`probe` (TEST 5) is the one that decides whether this run was worth it. The
+comparison is against the centered 4,966-structure run: **P@L/5 0.053, AUC 0.611**.
+This run's entire premise is that 31× more data closes the 42× train/val gap; if
+P@L/5 has not moved, more data was not the answer.
 
-- stays around **0.02**, where it starts → no shortcut. The fix was never needed and this run is
-  your model. Go straight to the 150k build.
-- climbs past **~0.05** and keeps rising → the shortcut is forming. Kill the run
-  at epoch 3–5 rather than paying for the rest.
-
-A single elevated value is not the signal; the trend across epochs is.
-
-**Step 3 — only if it climbed**, re-run with the fix and compare:
-
-```bash
-python train.py --epochs 10 --seed 0 --ckpt-dir ./ck_fix --position-centering
-python eval.py --test probe --ckpt ./ck_base/best.pt     # and ck_fix
-```
-
-Same `--seed`, so the split and batch order are identical and the only difference
-is the change. TEST 5 (`probe`) is the arbiter — it asks whether the frozen
-encoder still contains contact information, which is the direct test of "did the
-fix cost me anything real". If `probe` holds and `free` drops, take the fix to
-the 150k run.
-
-Two caveats if you get that far. 4,966 structures is not 150,000, so this screens
-the *mechanism*, not the final numbers — and keep watching `free` during the real
-run, since shortcut emergence is the part that genuinely does not transfer. And
-`eval.py` does not itself centre: with centering on, the component of `z` along
-the per-index mean gets no gradient, so it is unconstrained noise in the tests
-that mix indices (`retrieval`, `alignment`). That biases the comparison
-**against** the fix, so a win for it is trustworthy; a loss on those two
-specifically is the confound, not a finding, and `probe` is the tiebreak.
+`shortcut` (TEST 7) re-measures `free` on the frozen checkpoint and also reports
+`shuf`, the share of `z_seq` that survives permuting the amino acids within a
+chain. Note `best.pt` is selected on val loss, which in the archived baseline chose
+the *more* positional checkpoint — so check `free` on the actual saved model, not
+just the last epoch line.
 
 ## Before terminating
 
@@ -283,6 +314,7 @@ own machine. On macOS without Homebrew:
 mkdir -p ~/bin && curl -sL -o ~/bin/runpodctl \
   https://github.com/runpod/runpodctl/releases/download/v2.7.2/runpodctl-darwin-arm64
 chmod +x ~/bin/runpodctl
+export PATH="$HOME/bin:$PATH"     # or call it as ~/bin/runpodctl
 ```
 
 Verify the checkpoint before terminating:
@@ -293,20 +325,21 @@ python -c "import torch; c=torch.load('best.pt',map_location='cpu',weights_only=
 
 ## Reference: timings
 
-At 150,000 structures (extrapolated from a measured 1,067-structure random sample;
-measure your first epoch rather than trusting these):
+At 154,500 structures (extrapolated from a measured 1,067-structure random sample
+and the archived 4,966-structure run; measure your first epoch rather than trusting
+these):
 
 - Dataset build: **2–5 h** at `--workers 16`. 7.7 structures/s measured on a home
   connection at only 220% CPU of 8 cores, i.e. network-bound — a pod's network
   should do better, at which point pure-Python `MMCIFParser` (~59 ms/structure,
   2.5 CPU-hours total) becomes the limit and more workers help.
-- Dataset scan at startup: **~40 s** local disk, ~2.5 h on `/workspace`
-- Epoch on a 4090: **~35 min** (~9,640 steps at ≤4096 residues/batch). The
+- Dataset scan at startup: **~40 s** local disk, hours on `/workspace`
+- Epoch on a 4090: **~32 min** (~8,800 steps at ≤4096 residues/batch). The
   archived 50-epoch run was ~1 min/epoch at 286 steps on 4,966 structures.
 - Padding efficiency stays at 0.989 at this scale (length bucketing still works;
   batches hold 4–97 proteins, median 12)
 - Checkpoints ~500 MB each (43.1M params plus optimizer state)
-- Peak host RAM for the dataset object: ~220 MB at 150,000 files
+- Peak host RAM for the dataset object: ~220 MB
 
 ## Private repo
 

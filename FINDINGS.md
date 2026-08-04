@@ -21,6 +21,7 @@ Written down because none of it is derivable from the code or git history.
 | Best checkpoint | **epoch 17**, val 562.167 (val loss rises after that) |
 | Centering arm | same seed/epochs with `--position-centering`; best **epoch 9**, val 1071.370 |
 | Verdict | centering **prevents** the shortcut (`free` 0.172 → 0.065) at no measured cost |
+| Next run | full PDB — 154,500 structures, uncapped, `--position-centering`, 15 epochs |
 
 ---
 
@@ -40,7 +41,7 @@ to agree. That was not established before this run.
 Best val loss is 562.167 at epoch 17; by epoch 50 it is back to 661. A 40×
 train/val gap is memorisation, which is what a 43M-parameter model does to 1,547
 distinct proteins. **This is the run's biggest problem, and it is a dataset-size
-problem, not a loss problem** — scaling to the 21,561 clusters in `pdb_ids.txt`
+problem, not a loss problem** — scaling to the 21,598 clusters in `pdb_ids.txt`
 is what addresses it. Nothing about the positional fix touches it.
 
 **3. The positional shortcut is real, and it plateaus rather than running away.**
@@ -74,9 +75,16 @@ than either alone:
 | `free` | estimator's noise floor | untrained encoder | purely positional |
 
 `shuf` — how much of `z_seq` survives permuting the amino acids within a chain —
-reads 0.009 untrained and 1.000 for a position-only encoder. Where they disagree,
-trust `free`: a permuted chain is not a protein, so `shuf` asks the encoder about
-an input unlike anything it trained on.
+reads 0.009 untrained, 0.008 for an identity-only encoder and 1.000 for a
+position-only one. Where they disagree, trust `free`: a permuted chain is not a
+protein, so `shuf` asks the encoder about an input unlike anything it trained on.
+
+**`shuf` has not yet been read on a trained checkpoint.** TEST 7 landed after the
+pod was provisioned, so `eval.py --test shortcut` on the pod's older clone exited
+with a usage error and the pod was then terminated. Every `shuf` number above is
+from a synthetic or untrained encoder; the two arms' conclusions rest entirely on
+`free` and TEST 5. Running `--test shortcut` on the next run's `best.pt` is the
+cheapest open item in this file.
 
 ---
 
@@ -112,7 +120,7 @@ was lost.
 
 **3. It does not fix the overfitting**, and was never going to. At epoch 50 both
 arms sit at a **42×** train/val `on_diag` gap. That is a dataset-size problem —
-1,547 distinct proteins against 43M parameters — and it is what scaling to 21,561
+1,547 distinct proteins against 43M parameters — and it is what scaling to 21,598
 clusters is for.
 
 ### DO NOT compare val loss between the arms
@@ -146,9 +154,57 @@ favour centering.
   the centered arm starts overfitting sooner. Unexplained; possibly just noise in
   a val set of 473 chains.
 
-**Decision: run the 150k build with `--position-centering`.** It prevents the
+**Decision: run the full build with `--position-centering`.** It prevents the
 shortcut at no measured cost, and the open question — whether the shortcut
 re-emerges at 14× the diversity — is the one thing this dataset cannot answer.
+
+---
+
+## The scale-up: what is actually in `pdb_ids.txt`
+
+Measured on the committed `pdb_ids.txt` and `pdb_clusters.txt`:
+
+| | |
+|---|---|
+| structure IDs | **154,500** (all with a cluster assignment) |
+| distinct proteins at 30% identity | **21,598** |
+| redundancy | **7.2×** |
+| clusters contributing exactly one structure | **8,023** |
+| share of all structures from the top 1,000 clusters | **48.5%** |
+| disk, built (`.npz`, streamed — no `.cif` kept) | **0.43 GB** |
+
+The redundancy is why `--max-per-cluster` exists, and the table below is the
+reason it is **not** being used on the next run:
+
+| cap | structures | clusters | steps/epoch |
+|---|---|---|---|
+| 1 | 21,598 | 21,598 | ~1,230 |
+| 5 | 59,198 | 21,598 | ~3,373 |
+| 10 | 79,406 | 21,598 | ~4,525 |
+| 20 | 98,831 | 21,598 | ~5,632 |
+| none | 154,500 | 21,598 | ~8,800 |
+
+**Every cap yields the same 21,598 distinct proteins.** Capping buys no diversity
+at all; it only drops near-duplicate deposits — point mutants, ligand complexes,
+alternative conformations, better resolutions.
+
+Three things follow, and the third is the one that decided it:
+
+- **Disk is irrelevant.** 0.43 GB at the largest setting. An earlier version of
+  POD_SETUP capped partly on storage grounds; that reasoning was simply wrong.
+- **Compute is close to irrelevant too, if compared at fixed gradient steps rather
+  than fixed epochs.** At ~132,000 steps, uncapped gives 15 passes over 154,500
+  structures and `--max-per-cluster 5` gives 40 passes over 59,198 — the same GPU
+  hours either way.
+- **The duplicates are mild augmentation, not noise.** Different crystal forms of
+  the same protein are genuinely different contact maps. More distinct inputs seen
+  fewer times each is the better shape against memorisation, and memorisation is
+  this model's measured failure.
+
+The honest cost of going uncapped is imbalance: half the training time goes on 5%
+of the families. That is a real objection and it is unmeasured — nothing here says
+which effect wins. It is recorded so that a disappointing next run has a named
+suspect.
 
 ---
 
@@ -286,23 +342,39 @@ carries over — but nothing here measures whether bucketing changes what is lea
 
 ---
 
+## Done since the last revision of this list
+
+- **Trained it.** Two 50-epoch arms on 4,966 structures — the whole top half of
+  this file.
+- **Homology-aware split.** `random_split` put 40.3% of val chains' exact sequence
+  twins in train. Splitting is now grouped by 30%-identity cluster (0.8%), and
+  checkpoints record which they used under `split.grouped_by_cluster`.
+- **More data.** The 5,000-row RCSB query cap is gone; `pdb_ids.txt` now holds
+  154,500 IDs, and `pdb_clusters.txt` their cluster assignments.
+
 ## Next, in order
 
-1. **Train it.** 50 epochs, `--amp-dtype bf16`, `--num-workers 8`. Nothing below
-   is worth doing first, and nothing above is confirmed until this runs.
-2. **TEST 2 immediately after.** It is the only guard against the position
-   shortcut, and the seeding change is exactly what makes that risk live. A
-   collapsed real-vs-shuffled gap invalidates every other number.
-3. **Judge on `on_diag` and P@L/5**, never total loss — total falls forever via
-   the off-diagonal term. Early-stop on `on_diag`.
+1. **The full run.** 154,500 structures, uncapped, `--position-centering`, 15
+   epochs, `--amp-dtype bf16`, `--seed 0`. Runbook in
+   [POD_SETUP.md](POD_SETUP.md). It answers two things at once: whether 14× the
+   diversity closes the 42× train/val gap, and whether centering still contains
+   `free` at that scale.
+2. **TEST 5 against 0.053 / 0.611.** That is the centered arm's P@L/5 and AUC on
+   4,966 structures. If more data does not move P@L/5, more data was not the
+   answer, and item 4 becomes the priority rather than a control.
+3. **TEST 7 on `best.pt`**, for the `shuf` reading that has never been taken, and
+   because `best.pt` is selected on val loss — which in the baseline arm chose the
+   *more* positional checkpoint (epoch 17, `free` 0.229) over the less positional
+   one (epoch 50, 0.172).
 4. **The scratch control.** A contact head plus the same model trained from
    random init; **the delta is the result**. Beating random init is a low bar and
-   nothing in either findings file substitutes for this.
-5. **Homology-aware split.** `random_split` puts homologous proteins in both
-   train and val (see the myoglobins above), so held-out numbers are optimistic.
-   Any supervised claim needs a sequence-identity or CATH-family split first.
-6. **More data.** `get_files.py` caps the RCSB query at 5000 rows; the PDB has
-   ~200k.
+   nothing in either findings file substitutes for this. Sharpened by the finding
+   that `distance-only` already beats the trained encoder on AUC (0.760 vs 0.611).
+5. **Judge on `on_diag` and P@L/5**, never total loss — total falls forever via
+   the off-diagonal term. Early-stop on `on_diag`.
+6. **Only if the full run disappoints:** re-run with `--max-per-cluster 5` to test
+   whether the 48.5%-from-1,000-clusters imbalance was the cause. Same seed, same
+   step budget, 40 epochs instead of 15.
 
 ---
 
