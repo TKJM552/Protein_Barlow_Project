@@ -33,14 +33,9 @@ for checkpoints, which are ~500 MB each (the run keeps `best.pt` plus a rolling
 
 Everything below runs in RunPod's **web terminal** (Connect → Start Web Terminal).
 
-> **Repo name.** The project is now *Protein Barlow*, but the GitHub remote is
-> still `Protein_JEPA_Project` until it is renamed in the repo settings. The clone
-> below therefore uses the old URL and names the local directory explicitly. After
-> renaming on GitHub, swap the URL — GitHub redirects the old one, so both work.
-
 ```bash
 cd /root
-git clone https://github.com/TKJM552/Protein_JEPA_Project.git Protein_Barlow_Project
+git clone https://github.com/TKJM552/Protein_Barlow_Project.git
 cd /root/Protein_Barlow_Project
 export CKPT_DIR=/workspace/checkpoints
 ```
@@ -346,9 +341,9 @@ these):
 If you set the repo back to private, the pod needs a token to clone:
 
 ```bash
-git clone https://<token>@github.com/TKJM552/Protein_JEPA_Project.git Protein_Barlow_Project
+git clone https://<token>@github.com/TKJM552/Protein_Barlow_Project.git
 cd Protein_Barlow_Project
-git remote set-url origin https://github.com/TKJM552/Protein_JEPA_Project.git  # scrub it
+git remote set-url origin https://github.com/TKJM552/Protein_Barlow_Project.git  # scrub it
 ```
 
 Use a **classic** token with the top-level `repo` scope
