@@ -9,18 +9,32 @@ Written down because none of it is derivable from the code or git history.
 
 ---
 
-## Status: first run complete — it trains, and it takes the shortcut
+## Status: it retrieves unseen proteins, and it does not predict contacts
+
+The full-scale run is done. The one-line summary is that **the model learned
+something real and the two headline diagnostics disagree about whether that
+something is useful**, which is the state of play as of 2026-08-05.
 
 | | |
 |---|---|
 | Architecture | 2 encoders + Barlow Twins, no prediction head |
 | Parameters | 43.1M — sequence encoder 18.9M, map encoder 13.6M, expanders 10.5M |
-| Training set | 4,246 train / 473 val, from **1,547 sequence clusters** |
-| Batching | length-bucketed, ≤4096 residues/batch, 283 steps/epoch |
-| First full run | 2026-08-03, 50 epochs, 4090, bf16, `--seed 0`, no positional fix |
-| Best checkpoint | **epoch 17**, val 562.167 (val loss rises after that) |
-| Centering arm | same seed/epochs with `--position-centering`; best **epoch 9**, val 1071.370 |
-| Verdict | centering **prevents** the shortcut (`free` 0.172 → 0.065) at no measured cost |
+| Current run | 2026-08-05, **150,169 structures**, 21,265 clusters, 40 epochs, 4090, bf16, `--position-centering`, `--seed 0` |
+| Split | 135,147 train / 15,022 val, grouped by 30% identity |
+| Cost | 9,756 steps/epoch, 390,240 steps total, ~6 h |
+| Best checkpoint | **epoch 40**, val 596.319 — but see the selection bug below |
+| **Holds** | cross-modal retrieval on unseen families: **54% top-1 vs 6% random**, and rising with training |
+| **Fails** | linear contact probe: **P@L/5 0.028 vs 0.029 random**, and falling with training |
+| Superseded | the two 4,966-structure arms, kept further down as history |
+
+Run history, so the numbers below are attributable:
+
+| run | data | epochs | centering | best | where |
+|---|---|---|---|---|---|
+| baseline | 4,966 | 50 | off | epoch 17, val 562.167 | archived |
+| centered | 4,966 | 50 | on | epoch 9, val 1071.370 | archived |
+| **full** | **150,169** | **40** | **on** | epoch 40, val 596.319 | `/workspace/checkpoints/best.pt` |
+| short | 150,169 | 10 | on | epoch 10, val 594.084 | `/workspace/ck10/`, epochs 5 and 10 kept |
 | Next run | full PDB — 154,500 structures, uncapped, `--position-centering`, 15 epochs |
 
 ---
@@ -40,9 +54,14 @@ to agree. That was not established before this run.
 
 Best val loss is 562.167 at epoch 17; by epoch 50 it is back to 661. A 40×
 train/val gap is memorisation, which is what a 43M-parameter model does to 1,547
-distinct proteins. **This is the run's biggest problem, and it is a dataset-size
-problem, not a loss problem** — scaling to the 21,598 clusters in `pdb_ids.txt`
-is what addresses it. Nothing about the positional fix touches it.
+distinct proteins.
+
+> **This paragraph used to continue: "and it is a dataset-size problem, not a
+> loss problem — scaling to the 21,598 clusters in `pdb_ids.txt` is what
+> addresses it." That prediction has been tested and is WRONG.** At 21,265
+> clusters the gap is **48.6×**, marginally worse. See *The full run* below. The
+> claim is recorded rather than deleted because it is what justified spending a
+> night of GPU time.
 
 **3. The positional shortcut is real, and it plateaus rather than running away.**
 `free` (share of `z_seq` reproducible from position and chain length alone):
@@ -76,19 +95,27 @@ than either alone:
 
 `shuf` — how much of `z_seq` survives permuting the amino acids within a chain —
 reads 0.009 untrained, 0.008 for an identity-only encoder and 1.000 for a
-position-only one. Where they disagree, trust `free`: a permuted chain is not a
-protein, so `shuf` asks the encoder about an input unlike anything it trained on.
+position-only one.
 
-**`shuf` has not yet been read on a trained checkpoint.** TEST 7 landed after the
-pod was provisioned, so `eval.py --test shortcut` on the pod's older clone exited
-with a usage error and the pod was then terminated. Every `shuf` number above is
-from a synthetic or untrained encoder; the two arms' conclusions rest entirely on
-`free` and TEST 5. Running `--test shortcut` on the next run's `best.pt` is the
-cheapest open item in this file.
+> **This section used to say "where they disagree, trust `free`, because a
+> permuted chain is not a protein and `shuf` asks the encoder about an input
+> unlike anything it trained on." That guidance is now UNSUPPORTED.** On the full
+> run they disagree by 7× — `free` 0.058, `shuf` 0.406 — and the independent
+> evidence (TEST 5) sides with `shuf`. The reasoning above is still true as far as
+> it goes; it simply is not a reason to disbelieve `shuf` when `shuf` is
+> corroborated. See *What the two shortcut metrics actually caught* below.
+
+At the time the two 4,966-structure arms were written up, **`shuf` had never been
+read on a trained checkpoint** — TEST 7 landed after that pod was provisioned, so
+`--test shortcut` hit a usage error on its older clone and the pod was terminated.
+Every `shuf` number in this section is from a synthetic or untrained encoder, and
+both arms' conclusions rest entirely on `free` and TEST 5. That gap is why
+centering was declared a success on evidence that could not have detected its
+main limitation.
 
 ---
 
-## The centering arm: it PREVENTS the shortcut, and costs nothing
+## The centering arm: it prevents the shortcut `free` can see, and costs nothing
 
 Same seed, same 50 epochs, same data, `--position-centering` the only difference.
 
@@ -158,6 +185,11 @@ favour centering.
 shortcut at no measured cost, and the open question — whether the shortcut
 re-emerges at 14× the diversity — is the one thing this dataset cannot answer.
 
+**Outcome, since resolved:** it was run that way, and `free` did stay contained
+(0.058 at epoch 40). But `shuf` read 0.406 on the same checkpoint, so the shortcut
+was contained only in the linear component `free` can see. The decision was right
+on the evidence available and the evidence available was too narrow.
+
 ---
 
 ## The scale-up: what is actually in `pdb_ids.txt`
@@ -205,6 +237,224 @@ The honest cost of going uncapped is imbalance: half the training time goes on 5
 of the families. That is a real objection and it is unmeasured — nothing here says
 which effect wins. It is recorded so that a disappointing next run has a named
 suspect.
+
+---
+
+## The full run: 150,169 structures, 40 epochs, centering on
+
+2026-08-05. 135,147 train / 15,022 val over 21,265 clusters, 9,756 steps/epoch,
+390,240 steps, ~6 h on a 4090. `--position-centering --amp-dtype bf16 --seed 0`.
+
+### 1. More data did NOT close the train/val gap
+
+This was the entire premise of the scale-up, and it failed:
+
+| | 4,966-structure run | **150,169-structure run** |
+|---|---|---|
+| distinct proteins | 1,547 | **21,265** |
+| train / val `on_diag` gap | 42× | **48.6×** |
+
+**14× the diversity, and the gap is slightly worse.** Whatever this is, it is not
+a dataset-size problem. That was the leading hypothesis in this file for two
+weeks and it is now retired. The remaining candidates — untested — are model
+capacity against an objective that does not constrain enough, and the objective
+itself admitting solutions that do not transfer.
+
+### 2. Checkpoint selection is on the wrong quantity, and it cost this run
+
+Total val loss fell monotonically, 680 → 596, so selection kept promoting later
+epochs. But total loss is `on_diag + 0.005 × off_diag`, and the two halves moved
+in opposite directions:
+
+| | epoch 1 | **epoch 8** | epoch 40 |
+|---|---|---|---|
+| val `on_diag` (agreement) | 465 | **400** ← best | 453 |
+| val `off_diag` (decorrelation) | 43,035 | 42,191 | **28,577** |
+| val total | 680 | 611 | **596** ← selected |
+
+**Every bit of val improvement after epoch 8 came from the off-diagonal term.**
+Agreement — the thing the objective exists to produce — got 13% worse over the
+following 32 epochs. `best.pt` is the checkpoint with the worst late-run
+agreement.
+
+This file has said since the first run: *"Judge on `on_diag` and P@L/5, never
+total loss — total falls forever via the off-diagonal term."* The code never
+implemented it; [train.py:1099](train.py#L1099) still selects on total val loss.
+Written down, then not done.
+
+Two mitigations were tested and neither rescued the run — see section 4. Fixing
+selection is still correct, it just is not the explanation.
+
+### 3. The result that holds: retrieval on families never seen
+
+`--test retrieval --n-prot 100`, pool drawn from the val split, so no protein
+here has a 30%-identity homolog anywhere in training:
+
+| checkpoint | top-1 | top-3 | median rank | pooled z_map cosine |
+|---|---|---|---|---|
+| **random init** | **6%** | 9% | 31/100 | 0.985 |
+| epoch 5 | 38% | 61% | 2 | 0.881 |
+| epoch 10 | 44% | 60% | 2 | 0.830 |
+| **epoch 40** | **54%** | **74%** | **1** | 0.652 |
+
+Three things, in order of importance:
+
+- **54% against a 6% random baseline**, on unseen families, with 99 distractors.
+  This is the first unambiguous evidence that training produces something that
+  generalises.
+- **It rises monotonically with training** — 38 → 44 → 54. The most-trained
+  checkpoint is the best one, despite the 48.6× loss gap. So "overfitting" in the
+  loss sense does not mean the representation stopped improving.
+- The last column is the off-diagonal term doing visible work: different proteins'
+  pooled `z_map` vectors start at cosine 0.985 (indistinguishable) and separate to
+  0.652 as training proceeds.
+
+### 4. The result that does not hold: linear contact probe
+
+`--test probe`, TEST 5, all on the same 60 fit / 30 held-out protein pool:
+
+| checkpoint | P@L/5 (long-range) | AUC |
+|---|---|---|
+| epoch 5 | **0.036** | 0.616 |
+| epoch 10 | 0.029 | 0.639 |
+| epoch 40 | 0.028 | 0.636 |
+| random encoder | 0.029 | 0.542 |
+| distance-only | 0.038 | 0.758 |
+
+**P@L/5 falls with training — exactly opposite to retrieval.** And the best
+trained value ties the trivial distance-only prior.
+
+Two corrections to how this table should be read:
+
+- **"Pretraining added NOTHING" is too strong**, though that is what the tool
+  prints. Its verdict keys only on P@L/5. On AUC every trained checkpoint
+  separates cleanly from random — 0.616–0.639 against 0.542, consistent across
+  three independent checkpoints. There is real contact-relevant signal; it is too
+  diffuse to sharpen the top-L/5 predictions.
+- **0.036 vs 0.029 is about 1.5 standard errors** on 30 held-out proteins. The
+  epoch-5 advantage is nominal, not significant. It is also the reason the
+  "select on `on_diag`" fix cannot be credited with much: at 0.036 it would still
+  lose to distance-only.
+
+Also worth recording: TEST 5 draws its pool with `randperm` over the **whole**
+dataset, so ~90% of its "held-out" proteins are ones the model trained on. Not
+fixed, deliberately — the fix would break comparability with every earlier
+number in this file — but it means the probe numbers are, if anything, optimistic.
+
+### 5. What the two shortcut metrics actually caught
+
+| epoch | 1 | 6 | 20 | 40 |
+|---|---|---|---|---|
+| `free` | 0.158 | 0.086 | 0.062 | **0.058** |
+| `shuf` | 0.551 | 0.451 | 0.433 | **0.406** |
+
+`free` looks clean — 0.058, essentially the 0.065 the centered 4,966 arm gave, and
+far below the 0.250 an uncentered run peaks at. `shuf` says **40% of `z_seq`
+survives permuting the amino acids within the chain**, against 0.009 untrained.
+
+Both are measuring positional content. They disagree by 7×, and the explanation is
+mechanical: centering provably zeroes the **linear per-index mean**, which is
+exactly the quantity `free` decomposes. It places no constraint on nonlinear or
+higher-moment positional structure, and `shuf` says that is where the model went.
+
+**So centering did not fail — `free` stopped being able to see the thing it was
+installed to prevent.** The 4,966-structure experiment could not have caught this,
+because `shuf` was never read on those checkpoints.
+
+Unknown: whether 0.406 is bad. There is still no trained-model baseline for `shuf`
+from a model anyone considers healthy. It could be that 40% positional content is
+normal and harmless for a per-residue representation.
+
+### 6. Where this leaves the model
+
+Consistent story across all seven tests: **the model learns a protein-specific,
+transferable signature of a chain, and does not learn transferable pairwise
+contact geometry.** Retrieval (54% vs 6%), CKA (0.943 vs 0.059) and the `z_map`
+separation all improve with training; the pair probe does not.
+
+Those are not in conflict. Retrieval and CKA ask whether two representations of
+the *same* chain are arranged alike, which is exactly what Barlow Twins optimises.
+P@L/5 asks whether *which residues touch which* is linearly decodable from pairs
+of residue vectors — a question the objective never poses.
+
+---
+
+## On changing the metric after seeing the result
+
+Partway through the above, the argument was made that the linear pair probe is the
+wrong bar: a downstream contact transformer is meant to do the pairwise reasoning,
+so the encoder only owes it good per-residue chemistry, and one linear layer over
+`[v_i+v_j, v_i*v_j]` cannot be expected to extract structure from a 512-d
+embedding space.
+
+That argument is sound on its merits and was not invented to explain the result.
+It also arrived **after** a bad result on the metric it demotes, which is the
+classic way to fool yourself. Recorded here so a future reader can weigh it.
+
+A residue-level chemistry probe (TEST 8: amino-acid identity as a sanity floor,
+contact number as burial, with a **one-hot amino acid** row as the bar that makes
+it non-trivial) was specified in full and then set aside — the objection being
+that a single linear layer is the wrong instrument for any question asked of this
+embedding space. Nothing was built. The specification is in the session log if it
+is wanted later.
+
+What replaced it: TEST 4 was pointed at the val split and given `--n-prot`, which
+is what produced section 3 above. That test asks the matching question directly —
+do corresponding sequence/map pairs agree and non-corresponding ones not — with no
+linear readout anywhere.
+
+---
+
+## The diagnostics were flattering the model
+
+Three separate ways, all found in one session, all now known:
+
+**1. TEST 4 retrieved from the training set.** It sampled its protein pool with
+`randperm` over the whole dataset, so ~90% of what it retrieved was memorised.
+Every checkpoint read 100% and the test could not rank them. Pointed at the val
+split, the same checkpoints spread from 38% to 54% and random init drops to 6%.
+
+**2. TEST 4 calls an untrained model HEALTHY.** Its verdict rule is
+`top1 > 3 × chance` ([eval.py:409](eval.py#L409)). Random init scores 6% against
+1% chance and passes. This is the same effect as the untrained CKA finding further
+down — the architecture alone groups proteins. **The trained number is
+uninterpretable without the random-init row beside it**, and the test does not
+print one. Not yet fixed.
+
+**3. TEST 5's held-out proteins are mostly training proteins.** Same `randperm`
+flaw, not fixed, noted in section 4.
+
+The pattern is one thing: **a diagnostic that does not print its own untrained
+baseline will eventually be read as evidence.** The archived findings already
+listed "give every metric an untrained baseline" as a measurement trap. It was
+listed, and then three tests shipped without one.
+
+---
+
+## Operational traps, from running this at scale
+
+Cheap to hit, expensive in wall-clock:
+
+- **`--keep-epoch-ckpts` does not save every epoch.** It changes whether the
+  periodic save is *kept*, not how often it happens; cadence is
+  `CKPT_EVERY_EPOCHS = 5` ([train.py:149](train.py#L149)). A 10-epoch run with the
+  flag yields epochs 5 and 10 only. Pass `--ckpt-every 1` too.
+- **Without that flag, `last.pt` is a rolling file.** The 40-epoch run's epoch-8
+  weights — the ones with the best val agreement — were overwritten and are
+  unrecoverable.
+- **Python block-buffers stdout when it is a file.** `nohup python train.py > log`
+  shows nothing for minutes; the ~1.5 KB banner sits in an 8 KB buffer. Use
+  `python -u`, or a hard kill loses the tail of the log.
+- **`cd X && nohup ... &` backgrounds the whole list**, so the `cd` happens in a
+  subshell and the log lands relative to `X` while your prompt never moves. Put
+  the `cd` inside `bash -c`, and redirect to an absolute path.
+- **`--ckpt-dir` overrides the `CKPT_DIR` env var** ([train.py:182](train.py#L182)),
+  but the "saved best.pt" line prints only the basename, so there is no way to tell
+  from the log which directory was written.
+- **Epoch time does not scale with steps/epoch.** Estimating 32 min/epoch at 8,800
+  steps from a measured 1 min/epoch at 286 steps overshot by ~4×, because the
+  per-epoch validation pass, `free` and the probe are fixed costs that were most of
+  that minute. Measure the first epoch; do not extrapolate.
 
 ---
 
@@ -344,37 +594,49 @@ carries over — but nothing here measures whether bucketing changes what is lea
 
 ## Done since the last revision of this list
 
-- **Trained it.** Two 50-epoch arms on 4,966 structures — the whole top half of
-  this file.
+- **Trained it, twice, then at scale.** Two 50-epoch arms on 4,966 structures, then
+  40 epochs and 10 epochs on 150,169.
 - **Homology-aware split.** `random_split` put 40.3% of val chains' exact sequence
   twins in train. Splitting is now grouped by 30%-identity cluster (0.8%), and
   checkpoints record which they used under `split.grouped_by_cluster`.
-- **More data.** The 5,000-row RCSB query cap is gone; `pdb_ids.txt` now holds
-  154,500 IDs, and `pdb_clusters.txt` their cluster assignments.
+- **More data.** The 5,000-row RCSB query cap is gone; `pdb_ids.txt` holds 154,500
+  IDs and `pdb_clusters.txt` their cluster assignments.
+- **`shuf` read on trained checkpoints** for the first time — 0.406, and it
+  disagrees with `free` by 7×.
+- **TEST 4 retrieves from the val split** and takes `--n-prot`. This is what turned
+  a saturated 100% into the 6% / 38% / 44% / 54% spread that is now the run's
+  headline result.
 
 ## Next, in order
 
-1. **The full run.** 154,500 structures, uncapped, `--position-centering`, 15
-   epochs, `--amp-dtype bf16`, `--seed 0`. Runbook in
-   [POD_SETUP.md](POD_SETUP.md). It answers two things at once: whether 14× the
-   diversity closes the 42× train/val gap, and whether centering still contains
-   `free` at that scale.
-2. **TEST 5 against 0.053 / 0.611.** That is the centered arm's P@L/5 and AUC on
-   4,966 structures. If more data does not move P@L/5, more data was not the
-   answer, and item 4 becomes the priority rather than a control.
-3. **TEST 7 on `best.pt`**, for the `shuf` reading that has never been taken, and
-   because `best.pt` is selected on val loss — which in the baseline arm chose the
-   *more* positional checkpoint (epoch 17, `free` 0.229) over the less positional
-   one (epoch 50, 0.172).
-4. **The scratch control.** A contact head plus the same model trained from
-   random init; **the delta is the result**. Beating random init is a low bar and
-   nothing in either findings file substitutes for this. Sharpened by the finding
-   that `distance-only` already beats the trained encoder on AUC (0.760 vs 0.611).
-5. **Judge on `on_diag` and P@L/5**, never total loss — total falls forever via
-   the off-diagonal term. Early-stop on `on_diag`.
-6. **Only if the full run disappoints:** re-run with `--max-per-cluster 5` to test
-   whether the 48.5%-from-1,000-clusters imbalance was the cause. Same seed, same
-   step budget, 40 epochs instead of 15.
+1. **Give TEST 4 a random-init row.** It currently calls an untrained model
+   HEALTHY, and every retrieval number in this file is only meaningful against the
+   6% baseline that has to be obtained by a separate invocation. Same pattern TEST
+   5 already uses. This is small, and until it exists the best result in the file
+   rests on a comparison the tool does not make.
+2. **Select checkpoints on val `on_diag`, not total val loss.**
+   [train.py:1099](train.py#L1099). The advice has been in this file since the
+   first run. Cheap, correct, and worth roughly nothing on its own — do it so the
+   next question is not confounded by it.
+3. **The scratch control.** A contact head plus the same model trained from random
+   init; **the delta is the result**. Now the single highest-value open item,
+   because retrieval at 54% vs 6% shows the encoder learns *something*
+   transferable, and nothing in this file establishes that the something is worth
+   more than training the downstream model from scratch. Sharpened by
+   `distance-only` beating the trained encoder on AUC, 0.758 vs 0.636.
+4. **A `shuf` baseline from a model believed healthy.** 0.406 is currently
+   uninterpretable — the only reference points are 0.009 untrained and 1.000
+   synthetic-positional. Without a third point there is no way to tell whether 40%
+   positional content is a defect or normal.
+5. **Decide what the encoder is FOR, and test that.** The pair probe and the
+   retrieval test disagree because they ask different questions, and the project
+   has not committed to which one it needs. If the downstream contact transformer
+   is the consumer, the honest test is to train it on frozen `z_seq` and compare
+   against training it on one-hot sequence — item 3 in a different guise, and the
+   only version that settles the argument.
+6. **Only if a later run disappoints:** re-run with `--max-per-cluster 5` to test
+   whether the 48.5%-from-1,000-clusters imbalance matters. Same seed, same step
+   budget.
 
 ---
 
