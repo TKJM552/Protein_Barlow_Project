@@ -153,6 +153,9 @@ WARM_START = False         # --warm-start: allow --resume across an ARCHITECTURE
                            # change. Loads only the weights that still fit, drops
                            # the optimizer state, restarts the LR schedule.
 USE_AMP = True             # --no-amp to force full fp32 (cpu runs ignore this)
+SELECT_ON = "total"        # --select-on {total,on_diag}: which val number best.pt
+                           # tracks. They pick different epochs -- see the comment
+                           # at the is_best line for why the default is `total`.
 KEEP_EPOCH_CKPTS = False   # --keep-epoch-ckpts: write epoch_NNN.pt every
                            # CKPT_EVERY_EPOCHS instead of rolling one last.pt.
                            # Off by default: 10 snapshots of a 43M-param model
@@ -176,6 +179,7 @@ def apply_cli_overrides(args):
     subset of these flags, can reuse this function unchanged.
     """
     global DEVICE, USE_AMP, WARM_START, KEEP_EPOCH_CKPTS, POSITION_CENTERING
+    global SELECT_ON
 
     # argparse dest -> the module-level constant it overrides.
     for dest, constant in [
@@ -202,6 +206,8 @@ def apply_cli_overrides(args):
         KEEP_EPOCH_CKPTS = True
     if getattr(args, "position_centering", False):
         POSITION_CENTERING = True
+    if getattr(args, "select_on", None) is not None:
+        SELECT_ON = args.select_on
 
     config.amp_dtype(AMP_DTYPE)   # validate the dtype now, not 500 steps in
 
@@ -821,6 +827,9 @@ def save_checkpoint(path, epoch, modules, optimizer, scheduler, scaler, val_loss
         # because the two arms are otherwise indistinguishable from the file,
         # and comparing them is the whole point of running both.
         "position_centered": POSITION_CENTERING,
+        # Which val number chose this file. Two checkpoints from the same run can
+        # be different epochs depending on this, so it has to travel with the file.
+        "select_on": SELECT_ON,
         "sequence_encoder": modules["sequence_encoder"].state_dict(),
         "map_encoder": modules["map_encoder"].state_dict(),
         "expanders": modules["expanders"].state_dict(),
@@ -916,7 +925,7 @@ def load_checkpoint(source, modules, optimizer=None, scheduler=None, scaler=None
         # `position_centered` was missed when it was added and did exactly that.
         if name in MODULE_KEYS or name in ("epoch", "val_loss", "arch", "split",
                                            "optimizer", "scheduler", "scaler",
-                                           "position_centered"):
+                                           "position_centered", "select_on"):
             continue
         skipped.append(f"{name}.*: module no longer exists, discarded")
 
@@ -1036,6 +1045,7 @@ def main(smoke_only=False):
     print(f"  lr / weight_decay : {LR} / {WEIGHT_DECAY}   warmup {WARMUP_STEPS}")
     print(f"  position centring : "
           f"{'ON' if POSITION_CENTERING else 'OFF (baseline -- watch `free`)'}")
+    print(f"  best.pt tracks    : val {SELECT_ON}")
     print(f"  grad clip / amp   : {GRAD_CLIP} / "
           f"{AMP_DTYPE if use_amp else 'off (fp32)'}"
           f"{'' if not use_amp else ' (scaler ' + ('on' if scaler.is_enabled() else 'off') + ')'}")
@@ -1096,14 +1106,35 @@ def main(smoke_only=False):
               + (f" | free {free:.3f}" if free is not None else "")
               + (f" | shuf {shuf:.3f}" if shuf is not None else ""))
 
-        is_best = va_loss < best_val
+        # --select-on decides which number best.pt tracks.
+        #
+        #   total   (default) va_loss = on_diag + LAMBDA_OFFDIAG * off_diag
+        #   on_diag            the invariance term alone
+        #
+        # These pick DIFFERENT epochs, because after a point the two terms move in
+        # opposite directions: on the 150k run val on_diag bottomed at epoch 8 (400)
+        # and rose to 453 by epoch 40, while off_diag fell 43,035 -> 28,577 and
+        # carried the total down. Selecting on on_diag would have taken epoch 8.
+        #
+        # The default stays `total` on evidence, not inertia. Retrieval on unseen
+        # families -- the one test that shows this model generalising -- prefers the
+        # LATER checkpoints (38% -> 44% -> 54% top-1), agreeing with total loss and
+        # disagreeing with on_diag. The linear contact probe prefers the earlier
+        # ones and agrees with on_diag. Until one of those is established as the
+        # metric that matters, this flag exists so the choice is deliberate and
+        # recorded in the checkpoint rather than implied by the code.
+        selector = va_on if SELECT_ON == "on_diag" else va_loss
+        is_best = selector < best_val
         if is_best:
-            best_val = va_loss
+            best_val = selector
             # NOTE: in debug mode CKPT_PREFIX is "debug_", so these throwaway
             # checkpoints never overwrite real ones. Saving is otherwise untouched.
             save_checkpoint(os.path.join(CKPT_DIR, f"{CKPT_PREFIX}best.pt"),
                             epoch, modules, optimizer, scheduler, scaler, va_loss)
-            print(f"  new best val {best_val:.3f} -> saved {CKPT_PREFIX}best.pt")
+            # Names the quantity AND the directory: "saved best.pt" alone made it
+            # impossible to tell from a log which --ckpt-dir had been written.
+            print(f"  new best val {SELECT_ON} {best_val:.3f} -> saved "
+                  f"{os.path.join(CKPT_DIR, CKPT_PREFIX + 'best.pt')}")
 
         if epoch % CKPT_EVERY_EPOCHS == 0:
             # Rolling by default: each of these is ~500 MB (weights + optimizer
@@ -1153,6 +1184,14 @@ if __name__ == "__main__":
                          "makes a purely positional representation worth exactly "
                          "zero. OFF by default: run the baseline first, and turn "
                          "this on if `free` shows the shortcut actually forming")
+    rn.add_argument("--select-on", default=None, choices=["total", "on_diag"],
+                    dest="select_on",
+                    help="which val number best.pt tracks (default: total). "
+                         "`on_diag` is the invariance term alone; it picks EARLIER "
+                         "epochs, because after a point off_diag keeps falling and "
+                         "carries the total down while agreement degrades. Which is "
+                         "correct is unsettled -- retrieval prefers total, the "
+                         "contact probe prefers on_diag")
     rn.add_argument("--debug", action="store_true",
                     help="fast GPU-free pass over a tiny subset (cpu, 20 proteins, "
                          "2 epochs, batch 4) to catch shape/mask/wiring bugs")

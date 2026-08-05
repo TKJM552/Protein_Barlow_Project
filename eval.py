@@ -314,6 +314,54 @@ def collapse_diagnostics(modules, seed=0):
 # ===========================================================================
 # TEST 4 -- retrieval_accuracy
 # ===========================================================================
+def _retrieve(modules, ds, idx):
+    """Rank every protein's z_seq against every z_map. One row of TEST 4's table.
+
+    Kept separate so the trained and random-init rows run identical code over the
+    identical protein list -- the only difference between them is the weights.
+    """
+    reps = []
+    with torch.no_grad():
+        for i in idx:
+            seq_ints, cmap = ds[i]
+            L = seq_ints.shape[0]
+            ints = seq_ints.unsqueeze(0).to(DEVICE)
+            maps = cmap.unsqueeze(0).to(DEVICE)
+            mask = torch.ones(1, L, dtype=torch.bool, device=DEVICE)
+            z_seq, _ = modules["sequence_encoder"](ints, mask)
+            z_map, _ = modules["map_encoder"](maps, mask)
+            reps.append((z_seq[0].float(), z_map[0].float()))
+
+    # --- primary: CKA similarity (no pooling, rotation-invariant) ---------
+    N = len(reps)
+    sim = np.zeros((N, N))
+    for a in range(N):
+        for b in range(N):
+            sim[a, b] = linear_cka(reps[a][0][:CMP_LEN], reps[b][1][:CMP_LEN])
+
+    gold = np.arange(N)
+    ranks = (sim >= sim[gold, gold][:, None]).sum(1)
+
+    # --- secondary: the old pooled-cosine readout, for contrast -----------
+    # .cpu() before .numpy(): reps live on DEVICE, and on CUDA/MPS the conversion
+    # raises outright -- which used to abort this test (and the rest of --test all)
+    # on exactly the machines the model is trained on.
+    P = torch.stack([p.mean(0) for p, _ in reps])
+    T = torch.stack([t.mean(0) for _, t in reps])
+    Pn = P / P.norm(dim=1, keepdim=True).clamp_min(1e-8)
+    Tn = T / T.norm(dim=1, keepdim=True).clamp_min(1e-8)
+    off = ~torch.eye(N, dtype=torch.bool, device=Tn.device)
+
+    return {
+        "N": N,
+        "top1": 100 * float((sim.argmax(1) == gold).mean()),
+        "top3": 100 * float((ranks <= 3).mean()),
+        "median": int(np.median(ranks)),
+        "pooled_top1": 100 * float(((Pn @ Tn.T).argmax(1).cpu().numpy() == gold).mean()),
+        "pooled_cos": float((Tn @ Tn.T)[off].mean()),
+    }
+
+
 def retrieval_accuracy(modules, seed, n_prot=25):
     """Can we match each protein's sequence to ITS OWN structure, among distractors?
 
@@ -344,8 +392,9 @@ def retrieval_accuracy(modules, seed, n_prot=25):
     chance = 100.0 / n_prot
     print(f"  {n_prot} proteins, each matched against all {n_prot} structures.")
     print(f"  Chance top-1 = 1/{n_prot} = {chance:.1f}%")
-    print("  Expected HEALTHY : far above chance -> the mapping is protein-specific.")
-    print("  Expected BROKEN  : near chance -> nothing protein-specific learned.\n")
+    print("  The bar is the RANDOM INIT row, NOT chance: this architecture groups")
+    print("  proteins by fold before any training, so beating chance several times")
+    print("  over is what an untrained model does. Only the gap to random is learning.\n")
 
     train.set_mode(modules, train=False)
     # Proteins come from the VAL split, which is grouped by 30% sequence identity:
@@ -377,56 +426,50 @@ def retrieval_accuracy(modules, seed, n_prot=25):
     # chance line below must describe the pool actually used, not the request.
     chance = 100.0 / len(idx)
 
-    reps = []
-    with torch.no_grad():
-        for i in idx:
-            seq_ints, cmap = ds[i]
-            L = seq_ints.shape[0]
-            ints = seq_ints.unsqueeze(0).to(DEVICE)
-            maps = cmap.unsqueeze(0).to(DEVICE)
-            mask = torch.ones(1, L, dtype=torch.bool, device=DEVICE)
-            z_seq, _ = modules["sequence_encoder"](ints, mask)
-            z_map, _ = modules["map_encoder"](maps, mask)
-            reps.append((z_seq[0].float(), z_map[0].float()))
+    # Both rows are scored on the SAME proteins in the same order, so the only
+    # difference between them is the weights.
+    trained = _retrieve(modules, ds, idx)
+    train.set_seed(seed + 999)
+    random_modules = train.build_modules()
+    train.set_mode(random_modules, train=False)
+    set_dropout_zero(random_modules)
+    rnd = _retrieve(random_modules, ds, idx)
 
-    # --- primary: CKA similarity (no pooling, rotation-invariant) ---------
-    N = len(reps)
-    sim = np.zeros((N, N))
-    for a in range(N):
-        for b in range(N):
-            sim[a, b] = linear_cka(reps[a][0][:CMP_LEN], reps[b][1][:CMP_LEN])
+    N = trained["N"]
+    print(f"  {'weights':<18}{'top-1':<10}{'top-3':<10}{'median rank':<14}"
+          f"{'pooled z_map cos':<18}")
+    print("  " + "-" * 68)
+    for label, r in (("trained", trained), ("RANDOM INIT", rnd)):
+        print(f"  {label:<18}{r['top1']:<10.1f}{r['top3']:<10.1f}"
+              f"{r['median']:<14}{r['pooled_cos']:<18.3f}")
+    print(f"  {'chance':<18}{chance:<10.1f}{'--':<10}{N // 2:<14}{'--':<18}")
 
-    gold = np.arange(N)
-    ranks = (sim >= sim[gold, gold][:, None]).sum(1)
-    top1 = 100 * float((sim.argmax(1) == gold).mean())
-    top3 = 100 * float((ranks <= 3).mean())
-
-    print(f"  top-1 accuracy : {top1:.1f}%   (chance {chance:.1f}%)")
-    print(f"  top-3 accuracy : {top3:.1f}%")
-    print(f"  median rank    : {int(np.median(ranks))}/{N}   (chance {N // 2})")
-
-    # --- secondary: the old pooled-cosine readout, for contrast -----------
-    # .cpu() before .numpy(): reps live on DEVICE, and on CUDA/MPS the conversion
-    # raises outright -- which used to abort this test (and the rest of --test all)
-    # on exactly the machines the model is trained on.
-    P = torch.stack([p.mean(0) for p, _ in reps])
-    T = torch.stack([t.mean(0) for _, t in reps])
-    Pn = P / P.norm(dim=1, keepdim=True).clamp_min(1e-8)
-    Tn = T / T.norm(dim=1, keepdim=True).clamp_min(1e-8)
-    pooled_top1 = 100 * float(((Pn @ Tn.T).argmax(1).cpu().numpy() == gold).mean())
-    off = ~torch.eye(N, dtype=torch.bool, device=Tn.device)
+    top1, pooled_top1 = trained["top1"], trained["pooled_top1"]
     print(f"\n  for contrast, the OLD mean-pooled cosine readout: {pooled_top1:.1f}%")
     print(f"  (different proteins' pooled z_map sit at cosine "
-          f"{(Tn @ Tn.T)[off].mean():.3f} to each other --")
+          f"{trained['pooled_cos']:.3f} to each other --")
     print("   pooling collapses them together, which is why it cannot tell them apart)")
 
-    if top1 > 3 * chance:
-        print("\n  -> HEALTHY: the sequence->structure mapping is strongly protein-specific.")
-        if pooled_top1 < 3 * chance:
-            print("     NOTE: do NOT mean-pool these embeddings downstream. The signal is")
-            print("     in the residue ARRANGEMENT; averaging destroys it, as shown above.")
+    # The bar is RANDOM INIT, not chance. The architecture alone groups proteins by
+    # fold before any training (see FINDINGS), so a model can beat chance several
+    # times over while having learned nothing -- random init scores ~6% against 1%
+    # chance at n_prot=100, which the old `top1 > 3 * chance` rule called HEALTHY.
+    if top1 <= rnd["top1"] + 1e-9:
+        print(f"\n  -> BROKEN: trained ({top1:.1f}%) does not beat random init "
+              f"({rnd['top1']:.1f}%).")
+        print("     Whatever retrieval works here is architecture, not learning.")
+        return
+    if top1 < 2 * rnd["top1"]:
+        print(f"\n  -> WEAK: trained {top1:.1f}% vs random init {rnd['top1']:.1f}% "
+              f"-- above the baseline,")
+        print("     but not by much. Treat as suggestive, not established.")
     else:
-        print("\n  -> WARNING: near chance even under CKA; nothing protein-specific learned.")
+        print(f"\n  -> HEALTHY: trained {top1:.1f}% vs random init {rnd['top1']:.1f}% "
+              f"-- the sequence->structure")
+        print("     mapping is protein-specific, on proteins with no homolog in training.")
+    if pooled_top1 < 3 * chance:
+        print("     NOTE: do NOT mean-pool these embeddings downstream. The signal is")
+        print("     in the residue ARRANGEMENT; averaging destroys it, as shown above.")
 
 
 # ===========================================================================
