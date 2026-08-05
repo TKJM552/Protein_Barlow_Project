@@ -334,6 +334,11 @@ def retrieval_accuracy(modules, seed, n_prot=25):
 
     The old pooled-cosine number is still printed, as a standing warning that
     anything downstream which mean-pools these embeddings will lose the signal.
+
+    The pool is the VAL split, so every protein here is one the model has never
+    seen and has no 30%-identity homolog of in its training data. Raise --n-prot
+    to make the ranking harder: cost is O(n_prot^2) CKA evaluations, so 100 is
+    quick and 400 is a few minutes.
     """
     hr("TEST 4  retrieval_accuracy  -- is each protein's z_seq closest to ITS z_map?")
     chance = 100.0 / n_prot
@@ -343,7 +348,14 @@ def retrieval_accuracy(modules, seed, n_prot=25):
     print("  Expected BROKEN  : near chance -> nothing protein-specific learned.\n")
 
     train.set_mode(modules, train=False)
-    ds = dataset()
+    # Proteins come from the VAL split, which is grouped by 30% sequence identity:
+    # no cluster spans train and val, so nothing retrieved here has a homolog the
+    # model was trained on. This test used to sample the whole dataset, which made
+    # ~90% of the pool proteins the model had memorised -- and at a 48x train/val
+    # gap that is the easy case, which is why it read 100% at every checkpoint and
+    # could not tell them apart.
+    _, val_loader, _, _ = train.build_loaders()
+    ds = val_loader.dataset
     g = torch.Generator().manual_seed(seed)
 
     # Every CKA in the ranking must be computed over the SAME number of residues:
@@ -361,6 +373,9 @@ def retrieval_accuracy(modules, seed, n_prot=25):
     if len(idx) < 2:
         print(f"  too few proteins of length >= {CMP_LEN}; skipping.")
         return
+    # The val split may hold fewer long-enough proteins than asked for, and the
+    # chance line below must describe the pool actually used, not the request.
+    chance = 100.0 / len(idx)
 
     reps = []
     with torch.no_grad():
@@ -695,6 +710,10 @@ def main():
                              "alignment", "shortcut", "all"])
     ap.add_argument("--ckpt", default=None, help="checkpoint path (default: random init)")
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--n-prot", type=int, default=25,
+                    help="TEST 4 only: proteins in the retrieval pool, i.e. the true "
+                         "match plus n_prot-1 distractors. Chance top-1 is 1/n_prot, "
+                         "so raise this when the test saturates. Cost is O(n^2).")
     train.add_override_args(ap)   # --data-dir / --ckpt-dir / --device / --batch-size / ...
     args = ap.parse_args()
 
@@ -720,7 +739,7 @@ def main():
         collapse_diagnostics(m, seed=args.seed)
     if t in ("retrieval", "all"):
         m, _ = build_setup(ckpt, args.seed)
-        retrieval_accuracy(m, seed=args.seed)
+        retrieval_accuracy(m, seed=args.seed, n_prot=args.n_prot)
     if t in ("probe", "all"):
         m, _ = build_setup(ckpt, args.seed)
         linear_probe(m, seed=args.seed)
