@@ -377,6 +377,95 @@ python train_contact.py --arm <winner> --no-relpos --seed 0 ...    # the control
 `--no-relpos` removes the `|i-j|` embedding. If the score barely drops, the offset
 table was doing the work rather than the sequence.
 
+## Training the contact predictor (the two-arm experiment)
+
+This is the run that says whether the Barlow Twins pretraining was worth anything.
+It needs the same dataset as above and a Barlow Twins `best.pt`.
+
+### Validate the config in a minute, before committing hours
+
+```bash
+cd /root/Protein_Barlow_Project
+export DATA_DIR=/root/processed_dataset
+
+python train_contact.py --arm scratch --smoke-test
+python train_contact.py --arm pretrained --smoke-test \
+       --encoder-ckpt /workspace/checkpoints/best.pt
+```
+
+The smoke test asserts the things that are silent when they break: gradients reach
+the predictor, the frozen encoder receives **none** (or, under `--unfreeze`, that it
+receives some), and the checkpoint round-trips.
+
+For a real end-to-end rehearsal including eval and checkpointing, add
+`--max-steps 20`. That is a *validation* setting, not a training one — the LR
+schedule still spans the full steps/epoch, so such a run is not comparable to a
+real one.
+
+### The three arms
+
+```bash
+COMMON="--seed 0 --epochs 20 --amp-dtype bf16 --num-workers 8 --out-dir /workspace/contact"
+
+python train_contact.py --arm pretrained $COMMON \
+       --encoder-ckpt /workspace/checkpoints/best.pt
+python train_contact.py --arm random  $COMMON
+python train_contact.py --arm scratch $COMMON
+```
+
+Same `--seed` and `--epochs` in every arm or the comparison is void.
+
+| comparison | what it isolates |
+|---|---|
+| `pretrained` − `random` | **pretraining, cleanly** — identical architecture, capacity and freezing; only the weights differ |
+| `pretrained` − `scratch` | whether the pretrained features beat the trivial input at all |
+| `random` − `scratch` | how much of any gain is just the extra 6 blocks of depth |
+
+Read the epoch lines in this order:
+
+1. **Does any arm beat the `dist` column?** That is the trivial `|i-j|` prior, and
+   FINDINGS has it beating the encoder on AUC (0.758 vs 0.636). If nothing clears
+   it, every arm learned chain distance and the rest of the table is noise.
+2. **Does `pretrained` beat `random`?**
+3. Only then, absolute numbers.
+
+Optional fourth run: `--unfreeze` on the pretrained arm. That is the *product*
+setting rather than the experimental one — usually better contact maps, but it does
+not preserve the joint embedding and a win no longer isolates the representation.
+The **gap** between frozen and fine-tuned is itself informative: close means the
+pretraining already held what contacts need.
+
+And `--no-relpos` once, as the control that says how much of any score came from
+the `|i-j|` embedding rather than the sequence.
+
+### Memory
+
+The banner prints `peak GPU memory after one step` — **measured**. Retune
+`--pair-budget` from that number, not from any estimate in the docstrings.
+
+If it OOMs, lower `--pair-budget` (default 1,500,000). But note the floor: a
+protein bigger than the whole budget is still emitted alone, so the longest chain
+costs 990² = 980,100 pairs however low you go. Below that only `--crop` helps, and
+cropping means pairs further apart than the crop are never a training target.
+
+### It resumes
+
+`<arm>_last.pt` is written every epoch with optimizer, LR schedule and scaler
+state:
+
+```bash
+python train_contact.py --arm pretrained $COMMON \
+       --encoder-ckpt /workspace/checkpoints/best.pt \
+       --resume /workspace/contact/pretrained_last.pt
+```
+
+Pass the **same `--epochs`** as the original run — the cosine schedule anneals to
+zero at that number, and changing it puts a discontinuity in the LR. Resuming from
+`_best.pt` is refused (it carries no optimizer state), as is resuming across arms.
+
+`<arm>_best.pt` is selected on **val P@L/5**, not on loss — deliberately not
+repeating the selection that picked the worst-agreement checkpoint on the 150k run.
+
 ## Before terminating
 
 **Terminating destroys `/workspace` too.** Get the checkpoint off the pod first:

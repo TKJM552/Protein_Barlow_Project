@@ -96,6 +96,14 @@ class PairBudgetSampler(Sampler):
     LengthBucketSampler does it. Batch ORDER is reshuffled each epoch so the model
     does not see lengths in a fixed sequence; the contents of a batch are fixed,
     which is what makes the memory bound hold.
+
+    **The budget has a FLOOR, and it is L_max^2.** A protein larger than the whole
+    budget is still emitted alone -- dropping it would silently bias training
+    toward short chains -- so the longest chain in the set costs 990^2 = 980,100
+    pairs no matter how low --pair-budget goes. Lowering the budget past that point
+    buys nothing; only --crop does, at the cost of never training on pairs further
+    apart than the crop. On a 24 GB card this is a non-issue (~7.5 GB checkpointed),
+    but it is why a CPU run needs --crop to finish at all.
     """
 
     def __init__(self, lengths, budget=PAIR_BUDGET, shuffle=True, seed=0):
@@ -184,9 +192,25 @@ class PretrainedInput(nn.Module):
     fine-tuned >> frozen means the encoder had to change substantially to be useful.
     """
 
-    def __init__(self, ckpt_path, device, unfreeze=False):
+    def __init__(self, ckpt_path, device, unfreeze=False, random_init=False, seed=0):
         super().__init__()
-        self.encoder = train.load_sequence_encoder(ckpt_path, device)
+        if random_init:
+            # The DEPTH control. Identical architecture, identical freezing, only
+            # the weights differ -- so `pretrained` minus `random` isolates what
+            # pretraining contributed, with no confound.
+            #
+            # It is needed because `pretrained` vs `scratch` compares 8 transformer
+            # blocks against 2: six frozen encoder blocks plus the predictor's two,
+            # versus the predictor's two alone. A win there could be depth rather
+            # than pretraining, and this arm is what separates them.
+            #
+            # Offset seed so these weights are not the predictor's init draw. Same
+            # convention as eval.py's random-encoder baselines.
+            train.set_seed(seed + 999)
+            self.encoder = train.SequenceEncoder().to(device)
+        else:
+            self.encoder = train.load_sequence_encoder(ckpt_path, device)
+        self.random_init = random_init
         self.unfrozen = unfreeze
         for p in self.encoder.parameters():
             p.requires_grad_(unfreeze)
@@ -224,7 +248,7 @@ class ScratchInput(nn.Module):
         return self.embed(ints)
 
 
-def build_input(arm, ckpt_path, device, unfreeze=False):
+def build_input(arm, ckpt_path, device, unfreeze=False, seed=0):
     if arm == "pretrained":
         if not ckpt_path or not os.path.exists(ckpt_path):
             raise SystemExit(
@@ -232,8 +256,13 @@ def build_input(arm, ckpt_path, device, unfreeze=False):
                 f"checkpoint; got {ckpt_path!r}")
         return PretrainedInput(ckpt_path, device, unfreeze).to(device)
     if unfreeze:
-        raise SystemExit("--unfreeze applies only to --arm pretrained; the scratch "
-                         "arm's embedding is trained either way")
+        raise SystemExit(f"--unfreeze applies only to --arm pretrained. The scratch "
+                         f"arm's embedding is trained either way, and the random arm "
+                         f"is frozen by definition -- unfreezing it would just be a "
+                         f"bigger scratch arm.")
+    if arm == "random":
+        return PretrainedInput(None, device, unfreeze=False,
+                               random_init=True, seed=seed).to(device)
     return ScratchInput().to(device)
 
 
@@ -330,7 +359,8 @@ def evaluate(model, provider, dataset, indices, device, pos_w, long_w,
             "p_strict_dist": mean(rows[STRICT_SEP][1])}
 
 
-def save_checkpoint(path, args, model, provider, epoch, metrics):
+def save_checkpoint(path, args, model, provider, epoch, metrics,
+                    opt=None, sched=None, scaler=None, best=None):
     """Everything needed to reproduce the number, not just the weights.
 
     The two arms differ only in their input, so a checkpoint that does not record
@@ -353,7 +383,42 @@ def save_checkpoint(path, args, model, provider, epoch, metrics):
         # saved or the fine-tuned weights are lost when the run ends.
         "provider": (None if args.arm == "pretrained" and not args.unfreeze
                      else provider.state_dict()),
+        # Present only in *_last.pt. Without these a --resume would restart the
+        # optimizer moments and the LR schedule, which is a warm start wearing a
+        # resume's name -- and an LR discontinuity mid-cosine is not recoverable.
+        "opt": opt.state_dict() if opt is not None else None,
+        "sched": sched.state_dict() if sched is not None else None,
+        "scaler": scaler.state_dict() if scaler is not None else None,
+        "best": best,
     }, path)
+
+
+def maybe_resume(path, args, model, provider, opt, sched, scaler):
+    """Restore a run from *_last.pt. Returns (start_epoch, best_so_far).
+
+    Refuses to resume across an ARM change: the two arms have different providers
+    and different parameter groups, so the optimizer state would be meaningless
+    even where the shapes happen to line up.
+    """
+    if not path:
+        return 1, -1.0
+    if not os.path.exists(path):
+        raise SystemExit(f"--resume: no such file {path!r}")
+    ck = torch.load(path, map_location="cpu", weights_only=False)
+    if ck["arm"] != args.arm:
+        raise SystemExit(f"--resume: checkpoint is arm {ck['arm']!r}, this run is "
+                         f"{args.arm!r}. Resuming across arms is not meaningful.")
+    if ck.get("opt") is None:
+        raise SystemExit(f"--resume: {path!r} has no optimizer state. It is probably "
+                         f"a *_best.pt; resume from *_last.pt instead.")
+    model.load_state_dict(ck["model"])
+    if ck["provider"] is not None:
+        provider.load_state_dict(ck["provider"])
+    opt.load_state_dict(ck["opt"])
+    sched.load_state_dict(ck["sched"])
+    scaler.load_state_dict(ck["scaler"])
+    print(f"  resumed from {path} at epoch {ck['epoch']}, best P@L/5 {ck['best']:.3f}")
+    return ck["epoch"] + 1, ck["best"]
 
 
 def estimate_weights(loader, device, n_batches=WEIGHT_EST_BATCHES):
@@ -383,9 +448,15 @@ def estimate_weights(loader, device, n_batches=WEIGHT_EST_BATCHES):
 # ---------------------------------------------------------------------------
 def main():
     ap = argparse.ArgumentParser(description="Contact predictor training")
-    ap.add_argument("--arm", required=True, choices=["pretrained", "scratch"],
-                    help="pretrained = frozen z_seq; scratch = embedding lookup. "
-                         "Run BOTH -- one alone answers nothing")
+    ap.add_argument("--arm", required=True,
+                    choices=["pretrained", "scratch", "random"],
+                    help="pretrained = frozen z_seq from --encoder-ckpt; scratch = "
+                         "a 21-row embedding lookup; random = the SAME encoder "
+                         "architecture at random init, frozen. No arm answers "
+                         "anything alone: pretrained-vs-random isolates pretraining "
+                         "(identical depth and capacity, only the weights differ), "
+                         "pretrained-vs-scratch asks whether it beats the trivial "
+                         "input, and random-vs-scratch says how much was just depth")
     ap.add_argument("--encoder-ckpt", default=None,
                     help="Barlow Twins checkpoint for --arm pretrained")
     ap.add_argument("--epochs", type=int, default=EPOCHS)
@@ -423,6 +494,25 @@ def main():
                          "--lr / 10). A single LR across both lets large early "
                          "updates wreck the pretrained weights while the predictor "
                          "is still random")
+    ap.add_argument("--eval-proteins", type=int, default=EVAL_PROTEINS,
+                    help="val proteins scored each epoch, drawn once and then "
+                         "fixed. Eval is uncropped and one protein at a time, so "
+                         "this is the main cost between epochs. Lowering it makes "
+                         "P@L/5 noisier -- do not compare runs that used different "
+                         "values")
+    ap.add_argument("--max-steps", type=int, default=0,
+                    help="stop each epoch after N steps (0 = whole epoch). For "
+                         "validating a config end to end -- including eval, "
+                         "checkpointing and resume -- in a minute instead of "
+                         "committing hours. NOT a training setting: the LR "
+                         "schedule still spans the full steps/epoch, so a run "
+                         "using this is not comparable to one that does not")
+    ap.add_argument("--resume", default=None,
+                    help="continue from a *_last.pt, restoring optimizer, LR "
+                         "schedule and scaler as well as the weights. Pass the "
+                         "SAME --epochs as the original run: the cosine schedule "
+                         "anneals to zero at that number, so changing it puts a "
+                         "discontinuity in the LR")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--out-dir", default="./contact_ckpt")
     ap.add_argument("--max-eval-len", type=int, default=MAX_EVAL_LEN)
@@ -439,9 +529,11 @@ def main():
     tr_loader, val_set, n_train, n_val = build_pair_loaders(args.seed,
                                                             args.pair_budget)
     g = torch.Generator().manual_seed(args.seed)
-    eval_idx = torch.randperm(len(val_set), generator=g)[:EVAL_PROTEINS].tolist()
+    eval_idx = torch.randperm(len(val_set),
+                              generator=g)[:args.eval_proteins].tolist()
 
-    provider = build_input(args.arm, args.encoder_ckpt, device, args.unfreeze)
+    provider = build_input(args.arm, args.encoder_ckpt, device, args.unfreeze,
+                           args.seed)
     model = ContactPredictor(use_relpos=not args.no_relpos,
                              symmetric=args.symmetric,
                              grad_checkpoint=not args.no_checkpoint).to(device)
@@ -491,7 +583,10 @@ def main():
     if args.arm == "pretrained":
         print(f"  encoder           : "
               + (f"FINE-TUNED at lr {encoder_lr:.1e} (joint embedding NOT preserved)"
-                 if args.unfreeze else "frozen"))
+                 if args.unfreeze else "frozen, pretrained"))
+    elif args.arm == "random":
+        print(f"  encoder           : frozen, RANDOM INIT (depth control -- "
+              f"pretrained minus this is what pretraining bought)")
     print(f"  pos_weight        : {pos_w.item():.1f}  (non-contacts per contact)")
     print(f"  long_weight       : {long_w:.2f}  (short-range positives per long)")
     print(f"  scored on         : P@L/5 at |i-j| > {MIN_SEP} and >= {STRICT_SEP}")
@@ -521,11 +616,14 @@ def main():
         loss.backward()
         assert any(p.grad is not None and p.grad.abs().sum() > 0
                    for p in model.parameters()), "no gradient reached the predictor"
-        if args.arm == "pretrained":
+        if args.arm in ("pretrained", "random"):
             # The assertion FLIPS with --unfreeze, and both directions are worth
             # checking: a frozen encoder that quietly trains invalidates the whole
             # comparison, and an "unfrozen" encoder that gets no gradient is a
             # fine-tuning run that silently is not fine-tuning anything.
+            #
+            # The random arm must be frozen too, or it stops being a control on
+            # pretraining and becomes a control on "a big trainable encoder".
             got = [n for n, p in provider.named_parameters()
                    if p.grad is not None and p.grad.abs().sum() > 0]
             if args.unfreeze:
@@ -550,8 +648,10 @@ def main():
               f"proteins P@L/5 {m['p']:.3f} (distance-only {m['p_dist']:.3f})")
         return
 
-    best, reported_mem = -1.0, False
-    for epoch in range(1, args.epochs + 1):
+    start_epoch, best = maybe_resume(args.resume, args, model, provider,
+                                     opt, sched, scaler)
+    reported_mem = False
+    for epoch in range(start_epoch, args.epochs + 1):
         model.train()
         provider.train()
         running, n_seen = 0.0, 0
@@ -577,6 +677,8 @@ def main():
             if n_seen % LOG_EVERY == 0:
                 print(f"  [epoch {epoch} step {step}] loss {running/n_seen:.4f} "
                       f"lr {sched.get_last_lr()[0]:.2e}")
+            if args.max_steps and n_seen >= args.max_steps:
+                break
 
         m = evaluate(model, provider, val_set, eval_idx, device, pos_w, long_w,
                      amp_dtype, args.max_eval_len)
@@ -594,6 +696,15 @@ def main():
             path = os.path.join(args.out_dir, f"{args.arm}_best.pt")
             save_checkpoint(path, args, model, provider, epoch, m)
             print(f"  new best P@L/5 {best:.3f} -> {path}")
+
+        # Written EVERY epoch, best or not, and it carries optimizer/scheduler/
+        # scaler state so --resume is an actual resume rather than a warm start.
+        # best.pt cannot serve this: it is only written on an improvement, so a
+        # crash after a long plateau would resume from far behind, with a fresh
+        # optimizer and an LR schedule restarted at the wrong step.
+        save_checkpoint(os.path.join(args.out_dir, f"{args.arm}_last.pt"),
+                        args, model, provider, epoch, m,
+                        opt=opt, sched=sched, scaler=scaler, best=best)
 
     print(f"\ndone. best val P@L/5 (|i-j| > {MIN_SEP}) = {best:.3f}")
     print("This number means nothing alone. Run the other arm with the same "

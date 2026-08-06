@@ -589,13 +589,25 @@ to a downstream contact model.
 
 That question has exactly one honest test, and it is a controlled comparison:
 
-| | arm A -- `--arm pretrained` | arm B -- `--arm scratch` |
-|---|---|---|
-| input | frozen `z_seq` from a Barlow Twins `best.pt` | `nn.Embedding(21, 512)`, trained |
-| input parameters | **18.9M, frozen** | **10,752, trained** |
-| context in the input | six encoder blocks' worth | **none** |
-| predictor | identical, 7.17M | identical, 7.17M |
-| split / seed / epochs | identical | identical |
+| | `--arm pretrained` | `--arm random` | `--arm scratch` |
+|---|---|---|---|
+| input | frozen `z_seq` from a Barlow Twins `best.pt` | same encoder, **random weights**, frozen | `nn.Embedding(21, 512)`, trained |
+| input parameters | 18.9M, frozen | 18.9M, frozen | 10,752, trained |
+| blocks applied to the input | 6 + 2 | 6 + 2 | 2 |
+| predictor | identical, 7.17M | identical | identical |
+| split / seed / epochs | identical | identical | identical |
+
+| comparison | what it isolates |
+|---|---|
+| **pretrained - random** | **pretraining, cleanly** -- identical architecture, capacity and freezing; only the weights differ |
+| pretrained - scratch | whether pretrained features beat the trivial input at all |
+| random - scratch | how much of any gain was just the extra six blocks of depth |
+
+The `random` arm exists because pretrained-vs-scratch compares **8 transformer
+blocks against 2**. A win there could be depth rather than pretraining, and
+without this arm there is no way to tell. It is the same logic as the random-init
+rows in TEST 4 and TEST 5 -- the ones that showed the architecture alone scores
+5x chance.
 
 Arm B is a lookup table: every leucine in every protein gets the same 512 numbers,
 with no idea what is next to it. All context has to be built by the predictor's own
@@ -668,7 +680,13 @@ from the offset embedding rather than the sequence.
 
 Cropping is available (`--crop N`) but is NOT the default, because pairs further
 apart than the crop are never a training target -- a cap on what the model can
-learn, not just on memory. Instead: gradient checkpointing (~30% more compute),
+learn, not just on memory.
+
+**The pair budget has a floor of `L_max^2`.** A protein larger than the whole
+budget is still emitted alone, since dropping it would bias training toward short
+chains -- so the longest chain costs 990^2 = 980,100 pairs however low
+`--pair-budget` goes. Below that only `--crop` helps. On a 24 GB card this is a
+non-issue (~7.5 GB checkpointed); it is why a CPU run needs `--crop` to finish. Instead: gradient checkpointing (~30% more compute),
 plus `PairBudgetSampler`, which batches by **pair** count rather than residue count.
 `train.py`'s residue budget is correct for the encoder and bounds nothing here --
 4 proteins x 1024 and 20 x 205 are both 4,096 residues but 4.19M vs 0.84M pairs.
@@ -680,14 +698,30 @@ tensor per block, not the ~21 computed inside), which is why it is 8 blocks. WID
 ### Running it
 
 ```bash
-python train_contact.py --arm scratch    --seed 0 --epochs 20 --amp-dtype bf16
-python train_contact.py --arm pretrained --seed 0 --epochs 20 --amp-dtype bf16 \
-       --encoder-ckpt /workspace/checkpoints/best.pt
+COMMON="--seed 0 --epochs 20 --amp-dtype bf16 --out-dir /workspace/contact"
+python train_contact.py --arm pretrained $COMMON --encoder-ckpt <barlow best.pt>
+python train_contact.py --arm random  $COMMON
+python train_contact.py --arm scratch $COMMON
 ```
 
-Same `--seed` and `--epochs` in both, or the comparison is void. `--smoke-test`
-does one train step plus a few eval proteins and asserts the frozen encoder
-receives no gradients.
+Same `--seed` and `--epochs` in every arm, or the comparison is void.
+
+`--smoke-test` does one train step plus a few eval proteins and asserts the frozen
+encoder receives no gradients (or, under `--unfreeze`, that it receives some).
+`--max-steps 20` rehearses a whole epoch including eval and checkpointing in about
+a minute -- a validation setting, not a training one, since the LR schedule still
+spans the full steps/epoch.
+
+Two optional runs worth having: `--unfreeze` on the pretrained arm (the PRODUCT
+setting -- usually better maps, does not preserve the joint embedding, and the GAP
+between it and the frozen arm measures how much the representation already held),
+and `--no-relpos` once, as the control saying how much of any score came from the
+`|i-j|` embedding rather than the sequence.
+
+It resumes: `<arm>_last.pt` is written every epoch with optimizer, scheduler and
+scaler state. Pass the SAME `--epochs` when resuming -- the cosine anneals to zero
+at that number. Resuming from `_best.pt` is refused (no optimizer state), as is
+resuming across arms.
 
 `best.pt` here is selected on **val P@L/5**, not on loss -- deliberately not
 repeating the selection that picked the worst-agreement checkpoint on the 150k run.
