@@ -157,29 +157,53 @@ def build_pair_loaders(seed, budget):
 # The only thing that differs between the two arms
 # ---------------------------------------------------------------------------
 class PretrainedInput(nn.Module):
-    """Frozen sequence encoder. (B,L) ints -> (B,L,512), no gradient, ever.
+    """Pretrained sequence encoder. (B,L) ints -> (B,L,512).
 
-    Frozen rather than fine-tuned on purpose: the question is what the pretrained
-    representation ALREADY contains. Once the encoder can adapt, a win no longer
-    distinguishes "the representation was good" from "43.1M extra parameters were
-    good", and the scratch arm has no matching 43.1M to give it.
+    FROZEN by default, and that is the scientific setting: the question is what the
+    pretrained representation ALREADY contains. Once the encoder can adapt, a win no
+    longer distinguishes "the representation was good" from "18.9M extra trainable
+    parameters were good", and the scratch arm has no matching 18.9M to offer.
+
+    --unfreeze is the PRODUCT setting. Fine-tuning normally beats frozen features,
+    because z_seq was optimised to make two views agree, not to predict contacts,
+    and fine-tuning lets nearly-right features move toward what this task needs.
+
+    Three things it costs, all deliberate:
+
+      * trainable parameters go 7.2M -> 26.1M, and memorisation is this repo's
+        measured failure (a 48.6x train/val gap that more data did not fix)
+      * the JOINT embedding is not preserved. Nothing holds z_seq in the shared
+        space with z_map any more -- no map encoder, no Barlow Twins term. The
+        result is a supervised contact predictor that started from a joint
+        embedding, not a joint embedding. (best.pt on disk is untouched; this
+        writes a new model.)
+      * attribution is lost, per the first paragraph.
+
+    Worth running BOTH, because the gap between them measures the representation:
+    frozen ~= fine-tuned means the pretraining already held what contacts need;
+    fine-tuned >> frozen means the encoder had to change substantially to be useful.
     """
 
-    def __init__(self, ckpt_path, device):
+    def __init__(self, ckpt_path, device, unfreeze=False):
         super().__init__()
         self.encoder = train.load_sequence_encoder(ckpt_path, device)
+        self.unfrozen = unfreeze
         for p in self.encoder.parameters():
-            p.requires_grad_(False)
-        self.encoder.eval()
+            p.requires_grad_(unfreeze)
+        if not unfreeze:
+            self.encoder.eval()
 
     def train(self, mode=True):
-        # Stay in eval() whatever the training loop does, so the frozen encoder's
-        # dropout never fires and z_seq is deterministic for a given chain.
         super().train(mode)
-        self.encoder.eval()
+        if not self.unfrozen:
+            # Stay in eval() whatever the training loop does, so the frozen
+            # encoder's dropout never fires and z_seq is deterministic per chain.
+            self.encoder.eval()
         return self
 
     def forward(self, ints, mask):
+        if self.unfrozen:
+            return self.encoder(ints, mask)[0]
         with torch.no_grad():
             return self.encoder(ints, mask)[0].detach()
 
@@ -200,14 +224,37 @@ class ScratchInput(nn.Module):
         return self.embed(ints)
 
 
-def build_input(arm, ckpt_path, device):
+def build_input(arm, ckpt_path, device, unfreeze=False):
     if arm == "pretrained":
         if not ckpt_path or not os.path.exists(ckpt_path):
             raise SystemExit(
                 f"--arm pretrained needs --encoder-ckpt pointing at a Barlow Twins "
                 f"checkpoint; got {ckpt_path!r}")
-        return PretrainedInput(ckpt_path, device).to(device)
+        return PretrainedInput(ckpt_path, device, unfreeze).to(device)
+    if unfreeze:
+        raise SystemExit("--unfreeze applies only to --arm pretrained; the scratch "
+                         "arm's embedding is trained either way")
     return ScratchInput().to(device)
+
+
+def param_groups(model, provider, lr, encoder_lr):
+    """Two learning rates: the pretrained encoder gets the smaller one.
+
+    A single LR across both goes badly. Early on the predictor is random and
+    producing nonsense, so large updates flow into pretrained weights before there
+    is anything useful to steer them with -- the encoder drifts away from what
+    pretraining gave it before the head can exploit it (catastrophic forgetting).
+    A ~10x smaller LR on pretrained weights is the standard mitigation.
+    """
+    head = [p for p in model.parameters() if p.requires_grad]
+    enc = [p for p in provider.parameters() if p.requires_grad]
+    groups = [{"params": head, "lr": lr}]
+    if enc:
+        # ScratchInput's embedding is NEW, not pretrained, so it belongs with the
+        # head at the full rate. Only a fine-tuned encoder gets the reduced one.
+        is_pretrained = isinstance(provider, PretrainedInput)
+        groups.append({"params": enc, "lr": encoder_lr if is_pretrained else lr})
+    return groups
 
 
 # ---------------------------------------------------------------------------
@@ -294,13 +341,18 @@ def save_checkpoint(path, args, model, provider, epoch, metrics):
         "arm": args.arm, "epoch": epoch, "metrics": metrics,
         "use_relpos": not args.no_relpos, "symmetric": args.symmetric,
         "encoder_ckpt": args.encoder_ckpt, "seed": args.seed,
+        "unfrozen": args.unfreeze,
         "crop": args.crop, "pair_budget": args.pair_budget,
         "split": train._split_fingerprint(),
         "model": model.state_dict(),
-        # None in the pretrained arm: the encoder is frozen and already on disk
-        # at encoder_ckpt, so copying 18.9M parameters into every checkpoint would
-        # be storing the same tensors twice.
-        "provider": provider.state_dict() if args.arm == "scratch" else None,
+        # Skipped ONLY for a frozen pretrained encoder, which is unchanged and
+        # already on disk at encoder_ckpt -- storing 18.9M identical tensors in
+        # every checkpoint would be duplicating it.
+        #
+        # Under --unfreeze the encoder is NOT that file any more, so it must be
+        # saved or the fine-tuned weights are lost when the run ends.
+        "provider": (None if args.arm == "pretrained" and not args.unfreeze
+                     else provider.state_dict()),
     }, path)
 
 
@@ -357,6 +409,20 @@ def main():
                     help="drop the |i-j| embedding. The control that says how much "
                          "of the score came from the offset table rather than the "
                          "sequence")
+    ap.add_argument("--unfreeze", action="store_true",
+                    help="--arm pretrained only: fine-tune the encoder instead of "
+                         "freezing it. The PRODUCT setting -- usually better contact "
+                         "maps, but it does not preserve the joint embedding (nothing "
+                         "holds z_seq in z_map's space any more) and a win no longer "
+                         "isolates the representation from 18.9M extra trainable "
+                         "parameters. Run it alongside the frozen arm: the GAP "
+                         "between them measures how much the representation was "
+                         "already carrying")
+    ap.add_argument("--encoder-lr", type=float, default=None,
+                    help="LR for pretrained weights under --unfreeze (default: "
+                         "--lr / 10). A single LR across both lets large early "
+                         "updates wreck the pretrained weights while the predictor "
+                         "is still random")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--out-dir", default="./contact_ckpt")
     ap.add_argument("--max-eval-len", type=int, default=MAX_EVAL_LEN)
@@ -375,7 +441,7 @@ def main():
     g = torch.Generator().manual_seed(args.seed)
     eval_idx = torch.randperm(len(val_set), generator=g)[:EVAL_PROTEINS].tolist()
 
-    provider = build_input(args.arm, args.encoder_ckpt, device)
+    provider = build_input(args.arm, args.encoder_ckpt, device, args.unfreeze)
     model = ContactPredictor(use_relpos=not args.no_relpos,
                              symmetric=args.symmetric,
                              grad_checkpoint=not args.no_checkpoint).to(device)
@@ -387,7 +453,9 @@ def main():
 
     steps_per_epoch = len(tr_loader)
     total_steps = args.epochs * steps_per_epoch
-    opt = torch.optim.AdamW(trainable, lr=args.lr, weight_decay=WEIGHT_DECAY)
+    encoder_lr = args.encoder_lr if args.encoder_lr is not None else args.lr / 10
+    opt = torch.optim.AdamW(param_groups(model, provider, args.lr, encoder_lr),
+                            weight_decay=WEIGHT_DECAY)
 
     def lr_lambda(step):
         if step < WARMUP_STEPS:
@@ -420,6 +488,10 @@ def main():
     print(f"  relpos |i-j|      : {'OFF (control run)' if args.no_relpos else 'ON'}")
     print(f"  params            : {n_trainable/1e6:.2f}M trainable"
           + (f" + {n_frozen/1e6:.1f}M frozen encoder" if n_frozen else ""))
+    if args.arm == "pretrained":
+        print(f"  encoder           : "
+              + (f"FINE-TUNED at lr {encoder_lr:.1e} (joint embedding NOT preserved)"
+                 if args.unfreeze else "frozen"))
     print(f"  pos_weight        : {pos_w.item():.1f}  (non-contacts per contact)")
     print(f"  long_weight       : {long_w:.2f}  (short-range positives per long)")
     print(f"  scored on         : P@L/5 at |i-j| > {MIN_SEP} and >= {STRICT_SEP}")
@@ -450,9 +522,19 @@ def main():
         assert any(p.grad is not None and p.grad.abs().sum() > 0
                    for p in model.parameters()), "no gradient reached the predictor"
         if args.arm == "pretrained":
-            leaked = [n for n, p in provider.named_parameters() if p.grad is not None]
-            assert not leaked, f"frozen encoder received gradients: {leaked[:3]}"
-            print("  frozen encoder received NO gradients  OK")
+            # The assertion FLIPS with --unfreeze, and both directions are worth
+            # checking: a frozen encoder that quietly trains invalidates the whole
+            # comparison, and an "unfrozen" encoder that gets no gradient is a
+            # fine-tuning run that silently is not fine-tuning anything.
+            got = [n for n, p in provider.named_parameters()
+                   if p.grad is not None and p.grad.abs().sum() > 0]
+            if args.unfreeze:
+                assert got, "--unfreeze set but no gradient reached the encoder"
+                print(f"  encoder IS being fine-tuned: {len(got)} tensors have "
+                      f"gradients  OK")
+            else:
+                assert not got, f"frozen encoder received gradients: {got[:3]}"
+                print("  frozen encoder received NO gradients  OK")
         m = evaluate(model, provider, val_set, eval_idx[:5], device, pos_w, long_w,
                      amp_dtype, args.max_eval_len)
         # Exercise the save path too. Everything above can pass and the run still
