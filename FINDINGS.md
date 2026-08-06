@@ -35,7 +35,12 @@ Run history, so the numbers below are attributable:
 | centered | 4,966 | 50 | on | epoch 9, val 1071.370 | archived |
 | **full** | **150,169** | **40** | **on** | epoch 40, val 596.319 | `/workspace/checkpoints/best.pt` |
 | short | 150,169 | 10 | on | epoch 10, val 594.084 | `/workspace/ck10/`, epochs 5 and 10 kept |
-| Next run | full PDB — 154,500 structures, uncapped, `--position-centering`, 15 epochs |
+
+**Where a new session should start:** the pretraining phase is finished and written
+up. What is not done is the experiment that says whether any of it was worth doing
+— `contact_predictor.py` and `train_contact.py` are built, self-tested and **never
+run**. See *The contact predictor and the two-arm experiment* below, then item 1 of
+*Next, in order*. Everything between those two points is background.
 
 ---
 
@@ -566,6 +571,141 @@ The argument it might: AlphaFold's pair track is deliberately asymmetric because
 triangular updates encode a directed constraint (i -> k -> j), a mechanism this
 model does not have. Hence `--symmetric-pair` is a flag and an ablation, not a
 default.
+
+---
+
+## The contact predictor and the two-arm experiment
+
+**Status: built, self-tested, never trained.** Two files, both committed, neither
+has produced a result. This section is the handover.
+
+### Why it exists
+
+Every diagnostic in this file measures a proxy. Retrieval says the encoder learned
+something transferable (54% vs 6% random); the linear pair probe says it did not
+(0.028 vs 0.029). Neither answers the question the project is actually asking,
+which is whether the pretrained encoder is worth more than feeding raw amino acids
+to a downstream contact model.
+
+That question has exactly one honest test, and it is a controlled comparison:
+
+| | arm A -- `--arm pretrained` | arm B -- `--arm scratch` |
+|---|---|---|
+| input | frozen `z_seq` from a Barlow Twins `best.pt` | `nn.Embedding(21, 512)`, trained |
+| input parameters | **18.9M, frozen** | **10,752, trained** |
+| context in the input | six encoder blocks' worth | **none** |
+| predictor | identical, 7.17M | identical, 7.17M |
+| split / seed / epochs | identical | identical |
+
+Arm B is a lookup table: every leucine in every protein gets the same 512 numbers,
+with no idea what is next to it. All context has to be built by the predictor's own
+two RoPE blocks. **Arm A gets a 1,750x larger input model, pretrained on 135,000
+proteins. If it cannot beat the lookup table, the pretraining bought nothing** --
+and that is a clean result, not a failure of the test.
+
+The encoder is FROZEN in arm A on purpose. Let it fine-tune and a win no longer
+separates "the representation was good" from "43.1M more trainable parameters were
+good", and arm B has no matching 43.1M to offer.
+
+### Reading the result, in this order
+
+1. **Does EITHER arm beat distance-only on long-range P@L/5?** If not, nothing
+   below matters -- both learned the `|i-j|` prior and stopped. This is a live
+   risk: distance-only already beats the pretrained encoder on AUC, 0.758 vs 0.636.
+2. **Does A beat B?** That is the pretraining question.
+3. Only then, the absolute numbers.
+
+### Architecture, in one table
+
+`contact_predictor.py`. (B, L, 512) + mask -> (B, L, L) logits.
+
+| stage | shape | note |
+|---|---|---|
+| `in_proj` | (L, 512) | **no compression** -- see below |
+| 2x `TransformerBlock` | (L, 512) | reused from `seq_encoder`, RoPE |
+| `pair_init` | (L, L, 64) | `W_a h_i + W_b h_j + relpos(i-j)`; L^2 starts here |
+| 8x `AxialBlock` | (L, L, 64) | row attention, column attention, FFN |
+| `out` | (L, L) | symmetrised, `0.5*(x + x^T)` |
+
+**`SEQ_DIM = 512`, equal to the input, is a fairness constraint not a capacity
+choice.** `in_proj` runs per residue before any mixing. Arm B's embedding holds 21
+distinct vectors, so any width above 21 is lossless for it; arm A's `z_seq` is
+512-d and the Barlow Twins off-diagonal term actively decorrelates dimensions, so
+it likely uses most of that width. Narrowing here penalises precisely the arm under
+test. (An earlier version had 256, justified as saving pair memory -- wrong:
+`SEQ_DIM` never reaches an L^2 tensor, since `pair_init` maps `seq_dim -> PAIR_DIM`.)
+
+Axial attention rather than full attention over the grid: all-cells-to-all-cells is
+O(L^4). Rows then columns is O(L^3), and information still reaches anywhere in two
+hops -- `(i,j)` to `(i,k)` along a row, `(i,k)` to `(l,k)` down a column.
+
+### The three ways this model looks healthier than it is
+
+**1. Class imbalance.** Measured over 300 real proteins: **45.1 non-contacts per
+contact**. Answering "no contact" everywhere scores ~97.8% with a healthy-looking
+loss curve. `pos_weight_from_maps()` measures the ratio off the data.
+
+**2. The `|i-j|` shortcut.** Also measured: **72.3% of all contacts sit at
+`|i-j| < 12`**, because consecutive CA atoms are ~3.8 A apart against an 8 A
+threshold. So under a flat loss nearly three quarters of the gradient on positives
+lands on pairs obtainable from the offset alone.
+
+The fix is NOT to drop the short band from the loss -- the model then cannot
+predict it and the output has a hole down its diagonal. It is to rebalance:
+`long_weight_from_maps()` returns the multiplier making both bands contribute equal
+positive mass (**2.61** over those 300 proteins), and `separation_weight()` applies
+it as a two-band step. **Train on all pairs, weighted; score on long range only.**
+
+Run once with `--no-relpos` as the control that says how much of any score came
+from the offset embedding rather than the sequence.
+
+**3. Memory is L^2, not L.** A backward pass stores ~89 pair-sized tensors:
+
+| | L=218 (median) | L=512 | L=990 (longest) |
+|---|---|---|---|
+| plain | 1.1 GB | 6.0 GB | **22.3 GB** |
+| `grad_checkpoint=True` | 0.4 GB | 2.0 GB | **7.5 GB** |
+
+Cropping is available (`--crop N`) but is NOT the default, because pairs further
+apart than the crop are never a training target -- a cap on what the model can
+learn, not just on memory. Instead: gradient checkpointing (~30% more compute),
+plus `PairBudgetSampler`, which batches by **pair** count rather than residue count.
+`train.py`'s residue budget is correct for the encoder and bounds nothing here --
+4 proteins x 1024 and 20 x 205 are both 4,096 residues but 4.19M vs 0.84M pairs.
+
+Depth in the pair track is nearly free under checkpointing (one saved boundary
+tensor per block, not the ~21 computed inside), which is why it is 8 blocks. WIDTH
+(`PAIR_DIM`) is the expensive dial.
+
+### Running it
+
+```bash
+python train_contact.py --arm scratch    --seed 0 --epochs 20 --amp-dtype bf16
+python train_contact.py --arm pretrained --seed 0 --epochs 20 --amp-dtype bf16 \
+       --encoder-ckpt /workspace/checkpoints/best.pt
+```
+
+Same `--seed` and `--epochs` in both, or the comparison is void. `--smoke-test`
+does one train step plus a few eval proteins and asserts the frozen encoder
+receives no gradients.
+
+`best.pt` here is selected on **val P@L/5**, not on loss -- deliberately not
+repeating the selection that picked the worst-agreement checkpoint on the 150k run.
+
+The banner prints measured `torch.cuda.max_memory_allocated()` after the first
+epoch. **Retune `--pair-budget` from that number, not from the table above**, which
+is derived from reading the code rather than from a GPU.
+
+### Verified, and not
+
+Verified on the committed 4,966-structure dataset: both arms smoke-test clean; the
+frozen encoder receives no gradients; gradient checkpointing leaves gradients
+bit-identical (check `j`); a single protein can be overfitted to loss 0.016 with a
+planted long-range contact recovered (check `g`); measured `pos_weight` 33.4 and
+`long_weight` 2.12 on that dataset.
+
+Not verified: anything on a GPU, any real training run, any number that would go in
+a results table. **No arm has been run.**
 
 ---
 
