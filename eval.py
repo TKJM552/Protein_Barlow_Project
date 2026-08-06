@@ -588,12 +588,33 @@ def _evaluate_probe(enc, probe, mu, sd, ds, idx_list, mode):
 
 
 def linear_probe(modules, seed, n_train=60, n_test=30):
+    """Is contact information LINEARLY decodable from a pair of residue vectors?
+
+    Two caveats that the printed table cannot carry, both established after this
+    test was written and neither of them fixed here -- fixing either would break
+    comparability with every number already in FINDINGS.
+
+    1. The pool is the WHOLE dataset, so roughly 90% of the "held-out" proteins are
+       ones the model trained on. At the measured 48.6x train/val gap that inflates
+       the trained row. TEST 4 and TEST 8-style probes draw from the val split;
+       this one does not.
+    2. 60 fit / 30 held-out proteins is thin. The 0.036-vs-0.029 spread that
+       separated epoch 5 from epoch 40 on the 150k run is about 1.5 standard
+       errors -- i.e. not a separation.
+
+    And the question itself is narrow: a linear readout over [v_i+v_j, v_i*v_j]
+    cannot express the pairwise reasoning a contact transformer exists to do, so a
+    representation can be useful downstream and score near random here. That is
+    what train_contact.py is for; this stays as a cheap diagnostic, not an arbiter.
+    """
     hr("TEST 5  linear_probe  -- does the FROZEN encoder contain contact information?")
-    print("Precision@L/5 on LONG-RANGE (|i-j|>12) contacts -- the field-standard metric.")
+    print("Precision@L/5 on long-range contacts. NOTE |i-j|>12 is THIS REPO's cut;")
+    print("the contact-prediction literature calls 12..23 medium-range and reserves")
+    print("'long-range' for |i-j|>=24, so these sit on an easier bar than published")
+    print("numbers and are not directly comparable to them.")
     print("Expected: trained encoder > random encoder > distance-only.")
-    print("Verdict rules: if trained <= random, pretraining added nothing; if trained does not")
-    print("beat distance-only on long-range, it only learned the trivial 'near in")
-    print("sequence = near in space' prior, not real structure.\n")
+    print("Pool is the whole dataset, so most 'held-out' proteins were trained on;")
+    print("n=30 makes differences under ~0.01 unreadable. See the docstring.\n")
 
     ds = dataset()
     g = torch.Generator().manual_seed(seed)
@@ -622,9 +643,21 @@ def linear_probe(modules, seed, n_train=60, n_test=30):
         print(f"  {label:<18}{p_at:<22.3f}{auc:<8.3f}")
 
     trained_p, random_p, dist_p = rows[0][1], rows[1][1], rows[2][1]
+    trained_auc, random_auc = rows[0][2], rows[1][2]
     print("\n  VERDICT:")
     if trained_p <= random_p + 1e-6:
-        print("  * trained <= random  -> pretraining added NOTHING over random weights.")
+        print("  * P@L/5: trained <= random.")
+        # The verdict used to read "pretraining added NOTHING over random weights"
+        # here. That is too strong, and the AUC column disproves it: on the 150k
+        # run every trained checkpoint sat at 0.616-0.639 against random's 0.542
+        # while tying it on P@L/5. Real signal, too diffuse to sharpen the top L/5.
+        if trained_auc > random_auc + 0.02:
+            print(f"    But AUC separates: {trained_auc:.3f} vs random {random_auc:.3f}.")
+            print("    So there IS contact-relevant signal; it is too diffuse to")
+            print("    sharpen the top-L/5 predictions. Not 'nothing was learned'.")
+        else:
+            print("    AUC does not separate either -> nothing recoverable by a")
+            print("    LINEAR pair readout. Says little about a nonlinear one.")
     elif trained_p <= dist_p + 1e-6:
         print("  * trained > random but <= distance-only -> only the trivial sequence-")
         print("    proximity prior; no real long-range structure learned.")
@@ -704,7 +737,7 @@ def representational_alignment(modules, seed, n_prot=15):
 # ===========================================================================
 # TEST 7 -- positional shortcut
 # ===========================================================================
-def positional_shortcut(modules, seed=0):
+def positional_shortcut(modules, seed=0, centered=False):
     """Is the representation a positional lookup table rather than chemistry?
 
     Both numbers are computed by train.py so the epoch-line values and these are
@@ -715,9 +748,20 @@ def positional_shortcut(modules, seed=0):
       shuf -- how much of z_seq survives permuting the amino acids within each
               chain. Whatever survives was computed without reading identity.
 
-    They should roughly agree. Where they disagree, `free` is the more trustworthy
-    of the two: a shuffled chain is not a protein, so `shuf` asks the encoder about
-    an input unlike anything it trained on.
+    This docstring used to say that where they disagree, `free` is the more
+    trustworthy of the two, because a shuffled chain is not a protein and `shuf`
+    therefore asks the encoder about an input unlike anything it trained on. That
+    reasoning is still true and is no longer a reason to prefer `free`:
+
+    On the 150k run they disagreed SEVENFOLD -- free 0.058, shuf 0.406 -- and the
+    independent evidence (TEST 5) sided with shuf. The mechanism is now understood.
+    Centering provably zeroes the LINEAR per-index mean, which is exactly the
+    quantity `free` decomposes, and constrains nothing nonlinear. So a model can
+    route its positional content somewhere `free` cannot see, and `free` reports
+    0.058 while 40% of z_seq still survives having its amino acids permuted.
+
+    Read them as a PAIR. A low `free` with a high `shuf` means centering is working
+    and being routed around, which is the state the 150k checkpoint is in.
     """
     hr("TEST 7  positional_shortcut  -- is z_seq mostly just position?")
     # The probe MUST come from the val split, exactly as train.py builds it.
@@ -734,13 +778,23 @@ def positional_shortcut(modules, seed=0):
     shuf = train.shuffle_invariance(modules, probe)
     print(f"  free (variance from position+length alone) : {free:.3f}")
     print(f"  shuf (survives amino-acid permutation)     : {shuf:.3f}")
-    print( "\n  Reference points, measured on this dataset:")
-    print( "    0.005  the free estimator's own noise floor")
-    print( "    0.018  an UNTRAINED encoder")
-    print( "    0.994  a purely positional representation")
+    print( "\n  Reference points, measured:")
+    print( "                              free     shuf")
+    print( "    estimator noise floor    0.005    0.009")
+    print( "    UNTRAINED encoder        0.018    0.009")
+    print( "    150k run, centering ON   0.058    0.406")
+    print( "    purely positional        0.994    1.000")
     print( "\n  HIGH is bad -- it is the share of the representation obtained")
-    print( "  without reading any chemistry. Retrain with --position-centering")
-    print( "  to make a positional solution worth exactly zero to the loss.")
+    print( "  without reading any chemistry.")
+    if centered:
+        print( "\n  This checkpoint was trained WITH --position-centering, so a low")
+        print( "  `free` is expected and is not evidence of anything: centering")
+        print( "  zeroes the linear per-index mean, which is precisely what `free`")
+        print( "  measures. `shuf` is the number that still carries information.")
+    else:
+        print( "\n  Trained WITHOUT --position-centering. If `free` is climbing across")
+        print( "  epochs, that flag makes a purely positional solution worth exactly")
+        print( "  zero to the loss -- but see above: it only closes the linear route.")
 
 
 # ===========================================================================
@@ -791,7 +845,11 @@ def main():
         representational_alignment(m, seed=args.seed)
     if t in ("shortcut", "all"):
         m, _ = build_setup(ckpt, args.seed)
-        positional_shortcut(m, seed=args.seed)
+        # Read off the checkpoint, not a flag: the advice this test prints is the
+        # opposite depending on whether centering was already on, and a run that
+        # had it on will otherwise be told to turn it on.
+        positional_shortcut(m, seed=args.seed,
+                            centered=bool(ckpt and ckpt.data.get("position_centered")))
 
 
 if __name__ == "__main__":

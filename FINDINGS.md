@@ -282,8 +282,22 @@ total loss — total falls forever via the off-diagonal term."* The code never
 implemented it; [train.py:1099](train.py#L1099) still selects on total val loss.
 Written down, then not done.
 
-Two mitigations were tested and neither rescued the run — see section 4. Fixing
-selection is still correct, it just is not the explanation.
+Two mitigations were tested and neither rescued the run — see section 4.
+
+**And then the obvious fix turned out not to be obvious.** `--select-on
+{total,on_diag}` was added, and the default deliberately stayed `total`, against
+this file's own standing advice, because by then there was evidence:
+
+| | prefers | agrees with |
+|---|---|---|
+| retrieval on unseen families (54% at epoch 40) | **later** checkpoints | total val loss |
+| linear contact probe (0.036 at epoch 5) | **earlier** checkpoints | val `on_diag` |
+
+Selecting on `on_diag` would have optimised for the metric that is failing and
+against the one that is working. The flag exists so the choice is deliberate and
+stamped into the checkpoint; **the standing advice to early-stop on `on_diag` is
+withdrawn** until something establishes which metric matters. That is what the
+contact run is for.
 
 ### 3. The result that holds: retrieval on families never seen
 
@@ -458,6 +472,103 @@ Cheap to hit, expensive in wall-clock:
 
 ---
 
+## The contact predictor, and what building it measured
+
+Built 2026-08-06 as [contact_predictor.py](contact_predictor.py) and
+[train_contact.py](train_contact.py). Not yet run. Recorded now because several
+of the design decisions were settled by measurement rather than preference, and
+those measurements are results in their own right.
+
+### The shape of a contact map, measured over 300 proteins
+
+| | |
+|---|---|
+| contacts at `\|i-j\| < 12` | **72.3%** |
+| non-contacts per contact | **45.1** (33.6 over the batches `train_contact` samples) |
+| short-range positives per long-range one | **2.61** (2.77 likewise) |
+
+Both numbers are load-bearing, and neither was guessable:
+
+- **45.1** is why the loss needs `pos_weight`. Answering "no contact" to every
+  pair scores ~97.8% accuracy with a loss curve that falls convincingly.
+- **72.3%** is why it needs a *second*, separate weight. Consecutive CA atoms sit
+  ~3.8 A apart against an 8 A threshold, so proximity in the chain nearly forces
+  contact — those pairs are free, and under a flat loss **72% of the gradient on
+  positives lands on the band a model can get from `|i-j|` alone.**
+
+The first instinct — drop the short band from the loss — is wrong, and was
+corrected before it shipped: the model then cannot *predict* the short band, and
+a contact map with a hole down its diagonal is not a contact map. `long_weight`
+upweights the long-range pairs instead, and like `pos_weight` it is measured off
+the data rather than picked.
+
+### Whole proteins fit; cropping was never necessary
+
+Cropping is the standard answer to an L^2 model and it was the first design here.
+It has a cost that is easy to miss: **pairs further apart than the crop are never
+a training target**, so a 192-crop model has never once seen a contact between
+residues 400 apart. That is a cap on what can be learned, not just on what fits.
+
+Two changes removed the need. Estimated activation memory for one protein at
+`PAIR_DIM=64`:
+
+| L | plain | + checkpointing | + symmetric |
+|---|---|---|---|
+| 218 (median) | 1.1 GB | 0.4 GB | 0.3 GB |
+| 512 | 6.0 GB | 2.0 GB | 1.6 GB |
+| **990 (longest)** | **22.3 GB** | **7.5 GB** | **6.0 GB** |
+
+- **Gradient checkpointing** recomputes each axial block during backward instead
+  of storing it: ~89 pair-sized tensors down to ~30, for ~30% more compute.
+- **Batching by pairs, not residues.** `train.py`'s residue budget is correct for
+  the encoder and bounds nothing in a pair track. 4 proteins of 1024 and 20 of
+  205 are both 4096 residues but **4.2M vs 0.84M pairs** — five times the memory
+  from batches that look identical by the count that is actually being enforced.
+
+So `CROP = 0` is the default and training sees the same whole proteins evaluation
+does. **These are estimates derived from reading the code, not measurements** —
+fusion, early frees and bf16 all move them, so the first real run prints
+`torch.cuda.max_memory_allocated()` and `--pair-budget` should be retuned from
+that, not from the table.
+
+### Width is the expensive dimension
+
+`PAIR_DIM` is paid once per cell and there are L^2 cells, so it is not comparable
+to the sequence track's 512. Memory is linear in it; the linear layers are
+quadratic (C -> 4C -> C):
+
+| PAIR_DIM | memory at L=990 | linear FLOPs |
+|---|---|---|
+| 64 (current) | 7.5 GB | 1x |
+| 128 | 15.1 GB | 4x |
+| 256 | 30.1 GB | 16x |
+| 512 | 60.2 GB | **64x** |
+
+512 does not fit. 128 is the sensible ceiling and is what AlphaFold2 uses for its
+own pair track.
+
+### Symmetry buys ~30%, exactly rather than approximately
+
+A contact map is symmetric, so half the pair tensor is redundant. Storing only a
+triangle does not pay — GPUs are fast on dense rectangles and the gathers needed
+to rebuild rows cost more than the arithmetic they save. Exploiting it in the
+*operations* does: if `p` is symmetric then
+
+    column_attention(p) == row_attention(p).T
+
+so running both computes the same thing twice. One pass plus a transpose is
+identical output for half the attention work and 15 stored tensors per block
+instead of 21.
+
+The cost is that the pair tensor can then never hold an asymmetric feature at any
+depth. **Unmeasured.** The argument it does not matter: the target is symmetric.
+The argument it might: AlphaFold's pair track is deliberately asymmetric because
+triangular updates encode a directed constraint (i -> k -> j), a mechanism this
+model does not have. Hence `--symmetric-pair` is a flag and an ablation, not a
+default.
+
+---
+
 ## What changed, and why
 
 **1. The map seed is now the contact row, indexed by relative offset.**
@@ -592,6 +703,20 @@ carries over — but nothing here measures whether bucketing changes what is lea
 
 ---
 
+## The long-range threshold is not the field's
+
+`eval.py` calls `|i-j| > 12` long-range and used to print "the field-standard
+metric". It is not. The contact-prediction literature calls **12..23
+medium-range** and reserves **long-range for `|i-j| >= 24`**.
+
+Nothing internal is affected — trained, random and distance-only are all scored
+identically — but **every P@L/5 in this file sits on an easier bar than a
+published one** and none of them are quotable next to an external number. The
+claim is removed from the code, and `train_contact.py` reports both cuts every
+epoch so the stricter one exists from the first run.
+
+---
+
 ## Done since the last revision of this list
 
 - **Trained it, twice, then at scale.** Two 50-epoch arms on 4,966 structures, then
@@ -606,37 +731,45 @@ carries over — but nothing here measures whether bucketing changes what is lea
 - **TEST 4 retrieves from the val split** and takes `--n-prot`. This is what turned
   a saturated 100% into the 6% / 38% / 44% / 54% spread that is now the run's
   headline result.
+- **TEST 4 prints its own random-init row** and judges against it rather than
+  against chance, so it can no longer call an untrained model HEALTHY.
+- **`--select-on {total,on_diag}`** exists, and the default deliberately stayed
+  `total` against this file's own earlier advice — see below.
+- **The contact predictor and its two-arm training script**, above.
 
 ## Next, in order
 
-1. **Give TEST 4 a random-init row.** It currently calls an untrained model
-   HEALTHY, and every retrieval number in this file is only meaningful against the
-   6% baseline that has to be obtained by a separate invocation. Same pattern TEST
-   5 already uses. This is small, and until it exists the best result in the file
-   rests on a comparison the tool does not make.
-2. **Select checkpoints on val `on_diag`, not total val loss.**
-   [train.py:1099](train.py#L1099). The advice has been in this file since the
-   first run. Cheap, correct, and worth roughly nothing on its own — do it so the
-   next question is not confounded by it.
-3. **The scratch control.** A contact head plus the same model trained from random
-   init; **the delta is the result**. Now the single highest-value open item,
-   because retrieval at 54% vs 6% shows the encoder learns *something*
-   transferable, and nothing in this file establishes that the something is worth
-   more than training the downstream model from scratch. Sharpened by
-   `distance-only` beating the trained encoder on AUC, 0.758 vs 0.636.
-4. **A `shuf` baseline from a model believed healthy.** 0.406 is currently
+1. **Run both arms of `train_contact.py`.** Same `--seed`, same `--epochs`, one
+   with `--arm pretrained --encoder-ckpt <150k best.pt>` and one with
+   `--arm scratch`. **The delta is the result** — and it is the only thing that
+   settles the argument this file has been circling for weeks. Retrieval at 54%
+   vs 6% shows the encoder learns *something* transferable; nothing here shows it
+   is worth more than feeding raw amino acids to the same predictor.
+
+   Read the epoch lines in this order: (a) does **either** arm beat the
+   `dist` column, (b) does pretrained beat scratch, (c) absolute numbers. Skipping
+   (a) is how you conclude something from a model that learned `|i-j|`.
+
+2. **`--no-relpos` once, on whichever arm wins.** The offset embedding hands the
+   model the prior that already beats the pretrained encoder on AUC (0.758 vs
+   0.636). If the score barely moves without it, the table was doing the work.
+
+3. **A `shuf` baseline from a model believed healthy.** 0.406 is still
    uninterpretable — the only reference points are 0.009 untrained and 1.000
    synthetic-positional. Without a third point there is no way to tell whether 40%
-   positional content is a defect or normal.
-5. **Decide what the encoder is FOR, and test that.** The pair probe and the
-   retrieval test disagree because they ask different questions, and the project
-   has not committed to which one it needs. If the downstream contact transformer
-   is the consumer, the honest test is to train it on frozen `z_seq` and compare
-   against training it on one-hot sequence — item 3 in a different guise, and the
-   only version that settles the argument.
-6. **Only if a later run disappoints:** re-run with `--max-per-cluster 5` to test
-   whether the 48.5%-from-1,000-clusters imbalance matters. Same seed, same step
-   budget.
+   positional content is a defect or normal. The contact run supplies one for
+   free: if the pretrained arm wins downstream *while* sitting at `shuf` 0.406,
+   then 0.406 is survivable and the metric was over-read.
+
+4. **`--symmetric-pair` as an ablation**, after the arms. ~30% cheaper for
+   provably identical maths given a symmetric pair tensor; the only question is
+   whether never holding an asymmetric intermediate costs anything.
+
+5. **Only if the arms disappoint:** re-run the encoder with
+   `--max-per-cluster 5` to test whether the 48.5%-from-1,000-clusters imbalance
+   matters, and/or `--select-on on_diag` to test whether checkpoint selection
+   does. Both are cheap, both are unlikely, and neither is worth doing before
+   there is a downstream number to move.
 
 ---
 

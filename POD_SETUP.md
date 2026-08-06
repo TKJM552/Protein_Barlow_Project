@@ -3,9 +3,15 @@
 The sequence that actually worked, including the things that cost the most time
 on the first attempt.
 
-This is now the **full-scale runbook**: the whole 154,500-structure PDB set, with
-`--position-centering` on. The small-dataset baseline it replaces is finished and
-written up in [FINDINGS.md](FINDINGS.md) — do not redo it.
+**The encoder run is DONE.** 150,169 structures, 40 epochs, centering on,
+2026-08-05 — results in [FINDINGS.md](FINDINGS.md). Retrieval on unseen families
+holds (54% top-1 vs 6% random); the linear contact probe does not (0.028 vs 0.029
+random). Do not redo it, and do not redo the 4,966-structure baseline before it.
+
+What is left to run on a pod is the **contact predictor**, in two arms — jump to
+*The contact predictor* at the bottom. The encoder sections are kept because you
+need them to rebuild the dataset, and because the traps in them are not specific
+to which model you are training.
 
 ## The one non-obvious thing
 
@@ -158,18 +164,28 @@ or more means you are reading from network storage — move the dataset to `/roo
 ```bash
 python train.py --smoke-test        # one train + one val step, asserts grads reach all 3 groups
 
-nohup python train.py --amp-dtype bf16 --num-workers 8 --seed 0 \
-      --position-centering --epochs 15 > train.log 2>&1 &
+nohup python -u train.py --amp-dtype bf16 --num-workers 8 --seed 0 \
+      --position-centering --epochs 40 > train.log 2>&1 &
 tail -f train.log
 ```
 
 `nohup ... &` is what keeps training alive when the browser tab closes. Without
 it, closing the terminal kills the run. `Ctrl+C` stops the `tail`, not the training.
 
-Before it commits, the banner prints `steps/epoch` and `total steps` — expect
-**~8,800** and **~132,000**, about 32 min/epoch on a 4090 and ~8 hours total. It
-also prints `split by sequence cluster: N clusters`; a **WARNING** about a random
-split instead means `pdb_clusters.txt` is missing.
+**`python -u` is not optional.** With stdout redirected to a file Python buffers
+in 8 KB blocks, so the ~1.5 KB banner sits unwritten for minutes and the log looks
+empty — and a hard kill loses whatever is still in the buffer, which is exactly
+the output you would want.
+
+Before it commits, the banner prints `steps/epoch` and `total steps`. Measured on
+the real run: **9,756 steps/epoch**, 390,240 total, **~9 min/epoch**, ~6 h for 40
+epochs. (An earlier version of this file said 32 min/epoch. That was extrapolated
+from the 4,966-structure run's 1 min/epoch by step count, which wrongly scaled the
+fixed per-epoch costs — the val pass, `free`, the probe — that were most of that
+minute. Measure your first epoch; do not extrapolate.)
+
+It also prints `split by sequence cluster: N clusters`; a **WARNING** about a
+random split instead means `pdb_clusters.txt` is missing.
 
 Why each flag:
 
@@ -178,11 +194,16 @@ Why each flag:
   0.043 → 0.250 by epoch 6, while the centered arm stayed flat at 0.06–0.07 for all
   fifty epochs, at no measured cost to contact prediction (P@L/5 0.050 → 0.053).
   The baseline question is answered; there is no reason to pay for it twice.
-- **`--epochs 15`.** The cosine LR schedule anneals to zero at exactly this number,
+- **`--epochs 40`.** The cosine LR schedule anneals to zero at exactly this number,
   so it is locked in at launch. Resuming later with a different `--epochs` puts a
-  discontinuity in the LR, and a `best.pt` taken from a longer schedule is
-  un-annealed and slightly degraded. `EPOCHS = 50` in config was tuned when an
-  epoch was 286 steps; at ~8,800 it would be ~440,000 steps and well over a day.
+  discontinuity in the LR, and a `best.pt` from a longer schedule is un-annealed
+  and slightly degraded — so overshooting is not free, and neither is stopping
+  short. `EPOCHS = 50` in config was tuned when an epoch was 286 steps.
+- **`--keep-epoch-ckpts --ckpt-every 1`** if you want to compare epochs later.
+  `--keep-epoch-ckpts` alone does NOT save every epoch: it only changes whether the
+  periodic save is kept, and the cadence is `CKPT_EVERY_EPOCHS = 5`. Without both
+  flags `last.pt` is a rolling file, and the 40-epoch run's epoch-8 weights — the
+  best on val agreement — were overwritten and are unrecoverable.
 - **`--amp-dtype bf16`** on Ampere or newer (A100, A10, L4, H100, 30xx/40xx/50xx).
   Omit it on V100/T4 to use the fp16 default — that is now safe. The Barlow Twins
   loss is computed in fp32 regardless of `--amp-dtype`, because `off_diag` runs to
@@ -293,6 +314,69 @@ chain. Note `best.pt` is selected on val loss, which in the archived baseline ch
 the *more* positional checkpoint — so check `free` on the actual saved model, not
 just the last epoch line.
 
+## The contact predictor — the run that is actually outstanding
+
+Two arms, identical in every way except what feeds the predictor. **The delta is
+the result.** One arm alone answers nothing, so budget for both before starting
+either.
+
+```bash
+python train_contact.py --arm scratch --smoke-test          # ~1 min, checks wiring
+
+nohup python -u train_contact.py --arm scratch --seed 0 \
+      --amp-dtype bf16 --num-workers 8 > scratch.log 2>&1 &
+
+nohup python -u train_contact.py --arm pretrained --seed 0 \
+      --amp-dtype bf16 --num-workers 8 \
+      --encoder-ckpt /workspace/checkpoints/best.pt > pretrained.log 2>&1 &
+```
+
+Run them **sequentially**, not both at once — they will fight over the GPU and
+neither timing will mean anything.
+
+Each epoch line looks like:
+
+```
+epoch  1 | train 0.6210 | val 0.6483 | P@L/5 >12 0.081 (dist 0.034) | >=24 0.052 (dist 0.021)
+```
+
+Read it in this order, and do not skip the first:
+
+1. **Does EITHER arm beat the `dist` column?** `dist` is the trivial "closer in
+   the chain = more likely to touch" rule. FINDINGS measured it *beating* the
+   pretrained encoder on AUC (0.758 vs 0.636), so an arm that does not clear it
+   has learned the `|i-j|` prior and nothing else, and nothing below it matters.
+2. **Does `pretrained` beat `scratch`?** That is the pretraining question, and the
+   reason both files exist.
+3. Absolute numbers, last.
+
+`>12` is this repo's long-range cut; `>=24` is the literature's. Quote the second
+if you compare to anyone else's number.
+
+### Memory
+
+Batches are sized by **pair count** (`B x L_max^2`), not residue count, because
+that is what an L^2 model actually costs — 4 proteins of 1024 residues and 20 of
+205 are both 4096 residues but 4.2M vs 0.84M pairs. So `--pair-budget` is the OOM
+knob, and halving it is the first thing to try.
+
+After the first step the run prints **measured** peak GPU memory. Retune
+`--pair-budget` from that, not from the estimates in `contact_predictor.py` — those
+are derived from reading the code and are expected to be off.
+
+Do **not** reach for `--crop` first. It defaults to 0 (whole proteins) on purpose:
+cropping means pairs further apart than the crop are never a training target,
+which caps what the model can learn and not just what fits.
+
+### After the arms
+
+```bash
+python train_contact.py --arm <winner> --no-relpos --seed 0 ...    # the control
+```
+
+`--no-relpos` removes the `|i-j|` embedding. If the score barely drops, the offset
+table was doing the work rather than the sequence.
+
 ## Before terminating
 
 **Terminating destroys `/workspace` too.** Get the checkpoint off the pod first:
@@ -329,8 +413,16 @@ these):
   should do better, at which point pure-Python `MMCIFParser` (~59 ms/structure,
   2.5 CPU-hours total) becomes the limit and more workers help.
 - Dataset scan at startup: **~40 s** local disk, hours on `/workspace`
-- Epoch on a 4090: **~32 min** (~8,800 steps at ≤4096 residues/batch). The
-  archived 50-epoch run was ~1 min/epoch at 286 steps on 4,966 structures.
+- Encoder epoch on a 4090: **~9 min, measured** (9,756 steps at ≤4096
+  residues/batch), so ~6 h for 40 epochs. The archived 50-epoch run was ~1
+  min/epoch at 286 steps on 4,966 structures — **do not scale that by step count**,
+  most of that minute was the fixed per-epoch validation, `free` and probe costs,
+  and scaling it overshot by 4×.
+- Dataset tarball: `tar -C /root -cf /workspace/processed_dataset.tar
+  processed_dataset` is ~0.43 GB and saves the 2–5 h rebuild. Worth it for
+  reproducibility too: a rebuild can differ by a handful of transient RCSB
+  failures, which shifts the cluster split and makes future numbers not strictly
+  comparable to the ones in FINDINGS.
 - Padding efficiency stays at 0.989 at this scale (length bucketing still works;
   batches hold 4–97 proteins, median 12)
 - Checkpoints ~500 MB each (43.1M params plus optimizer state)
