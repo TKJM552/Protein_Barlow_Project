@@ -35,11 +35,39 @@ first run:
    and run `--use-relpos false` once as the control that says how much of your
    number came from the model versus from the offset embedding.
 
-3. MEMORY IS L^2. One (B=4, L=990, C=64) pair tensor is 1 GB, and each axial
-   block holds several. Train on random square CROPS (see crop_pair below);
-   evaluate on whole proteins under no_grad. The defaults here are deliberately
-   small -- 2.1M parameters against the encoder's 43.1M -- because this repo's
-   measured failure is memorisation, and a fat pair track would reach it faster.
+3. MEMORY IS L^2. A backward pass stores ~21 pair-sized tensors per axial block,
+   so a 990-residue protein -- the longest in the PDB set -- would need ~22 GB.
+
+   Cropping is the usual answer and it is available (crop_pair), but it is NOT
+   the default, because it caps what the model can LEARN and not just what fits:
+   pairs further apart than the crop are never a training target. Instead:
+
+     * grad_checkpoint=True (default) recomputes each axial block during backward
+       rather than storing it, so only the 4 block boundaries plus one block's
+       internals are live at once. ~89 tensors -> ~30, for ~30% more compute.
+     * batch by PAIR count, not residue count -- see train_contact.py. train.py's
+       residue budget is right for the encoder and bounds nothing here: 4 proteins
+       of 1024 and 20 of 205 are both 4096 residues but 4.2M vs 0.84M pairs.
+
+   Together those put the worst case near 7.5 GB, so whole proteins fit on a 24 GB
+   card and training matches evaluation exactly.
+
+WIDTH IS THE EXPENSIVE DIMENSION
+--------------------------------
+PAIR_DIM is paid once per CELL, and there are L^2 cells, so it is not comparable
+to the sequence track's 512. Memory scales linearly in it and the linear layers
+scale QUADRATICALLY (C -> 4C -> C):
+
+    PAIR_DIM     mem @ L=990     linear FLOPs
+        64            7.5 GB           1x
+       128           15.1 GB           4x
+       256           30.1 GB          16x
+       512           60.2 GB          64x
+
+64 is deliberately modest; 128 is the sensible upgrade and is what AlphaFold2
+uses for its own pair track. 512 does not fit. The defaults here are small on
+purpose -- 2.1M parameters against the encoder's 43.1M -- because this repo's
+measured failure is memorisation, and a fat pair track reaches it faster.
 """
 
 import math
@@ -47,6 +75,7 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 
 from seq_encoder import EMBED_DIM, TransformerBlock
 
@@ -70,8 +99,13 @@ RELPOS_CLIP = 32           # |i-j| beyond this shares one embedding. Past ~32 th
                            # exact offset stops being informative on its own, and
                            # a wider table is a wider shortcut.
 
-CROP = 192                 # residues per side during training. Peak pair memory
-                           # goes as CROP^2, so this is the OOM knob.
+CROP = 0                   # 0 = train on WHOLE proteins (the default). Set a
+                           # positive value only as an OOM fallback: cropping
+                           # means pairs further apart than CROP are never a
+                           # training target, which caps what can be learned and
+                           # not just what fits.
+SYMMETRIC = False          # see AxialBlock: halves the attention work, at the
+                           # cost of never representing an asymmetric feature
 
 
 # ---------------------------------------------------------------------------
@@ -90,24 +124,33 @@ class PairFeaturizer(nn.Module):
     """
 
     def __init__(self, seq_dim=SEQ_DIM, pair_dim=PAIR_DIM, use_relpos=True,
-                 relpos_clip=RELPOS_CLIP):
+                 relpos_clip=RELPOS_CLIP, symmetric=SYMMETRIC):
         super().__init__()
+        self.symmetric = symmetric
         self.proj_a = nn.Linear(seq_dim, pair_dim)
-        self.proj_b = nn.Linear(seq_dim, pair_dim)
+        # One shared projection in symmetric mode, so p_ij == p_ji by
+        # construction. Two separate ones otherwise -- see the docstring.
+        self.proj_b = self.proj_a if symmetric else nn.Linear(seq_dim, pair_dim)
         self.use_relpos = use_relpos
         self.relpos_clip = relpos_clip
         if use_relpos:
-            # 2 * clip + 1 buckets: every offset from -clip to +clip, ends saturating.
-            self.relpos = nn.Embedding(2 * relpos_clip + 1, pair_dim)
+            # Signed offset needs 2*clip+1 buckets (-clip..+clip). Symmetric mode
+            # indexes by |i-j| instead and needs clip+1 -- a signed table would
+            # itself break the symmetry, since relpos(i-j) != relpos(j-i).
+            self.relpos = nn.Embedding(
+                relpos_clip + 1 if symmetric else 2 * relpos_clip + 1, pair_dim)
 
     def forward(self, h):
         B, L, _ = h.shape
         p = self.proj_a(h).unsqueeze(2) + self.proj_b(h).unsqueeze(1)   # (B,L,L,C)
         if self.use_relpos:
             idx = torch.arange(L, device=h.device)
-            off = (idx[:, None] - idx[None, :]).clamp(-self.relpos_clip,
-                                                      self.relpos_clip)
-            p = p + self.relpos(off + self.relpos_clip)
+            off = idx[:, None] - idx[None, :]
+            if self.symmetric:
+                p = p + self.relpos(off.abs().clamp(max=self.relpos_clip))
+            else:
+                p = p + self.relpos(off.clamp(-self.relpos_clip, self.relpos_clip)
+                                    + self.relpos_clip)
         return p
 
 
@@ -156,15 +199,35 @@ class AxialAttention(nn.Module):
 
 
 class AxialBlock(nn.Module):
-    """Pre-LN row attention, then column attention, then FFN. Each residual."""
+    """Pre-LN row attention, then column attention, then FFN. Each residual.
+
+    symmetric=True drops the column pass entirely. This is not an approximation:
+    if p is symmetric then p == p.T, so
+
+        column_attention(p) == row_attention(p.T).T == row_attention(p).T
+
+    and running both computes the same thing twice. One pass plus a transpose
+    gives the identical result for half the attention work and 15 stored tensors
+    per block instead of 21.
+
+    What it costs is expressiveness, not correctness -- the pair tensor can then
+    never hold an asymmetric feature at any depth. Whether that matters is
+    UNMEASURED. The argument it does not: the target is symmetric. The argument it
+    might: AlphaFold's pair track is deliberately asymmetric because triangular
+    updates encode a directed constraint (i -> k -> j). This model has no such
+    mechanism, so it is probably fine -- hence a flag and an ablation, not a
+    default.
+    """
 
     def __init__(self, pair_dim=PAIR_DIM, n_heads=N_HEADS, mlp_ratio=MLP_RATIO,
-                 dropout=DROPOUT):
+                 dropout=DROPOUT, symmetric=SYMMETRIC):
         super().__init__()
+        self.symmetric = symmetric
         self.norm_row = nn.LayerNorm(pair_dim)
         self.row_attn = AxialAttention(pair_dim, n_heads, dropout)
-        self.norm_col = nn.LayerNorm(pair_dim)
-        self.col_attn = AxialAttention(pair_dim, n_heads, dropout)
+        if not symmetric:
+            self.norm_col = nn.LayerNorm(pair_dim)
+            self.col_attn = AxialAttention(pair_dim, n_heads, dropout)
         self.norm_ffn = nn.LayerNorm(pair_dim)
         self.ffn = nn.Sequential(
             nn.Linear(pair_dim, mlp_ratio * pair_dim),
@@ -181,11 +244,17 @@ class AxialBlock(nn.Module):
         km = mask[:, None, :].expand(B, L, L).reshape(B * L, L)
 
         h = self.norm_row(p).reshape(B * L, L, C)
-        p = p + self.row_attn(h, km).view(B, L, L, C)
+        r = self.row_attn(h, km).view(B, L, L, C)
 
-        h = self.norm_col(p).transpose(1, 2).reshape(B * L, L, C)
-        p = p + self.col_attn(h, km).view(B, L, L, C).transpose(1, 2)
+        if self.symmetric:
+            # r + r.T in one residual: the transpose IS the column pass.
+            p = p + 0.5 * (r + r.transpose(1, 2))
+        else:
+            p = p + r
+            h = self.norm_col(p).transpose(1, 2).reshape(B * L, L, C)
+            p = p + self.col_attn(h, km).view(B, L, L, C).transpose(1, 2)
 
+        # The FFN acts on each cell independently, so it preserves symmetry.
         return p + self.ffn(self.norm_ffn(p))
 
 
@@ -206,8 +275,14 @@ class ContactPredictor(nn.Module):
 
     def __init__(self, in_dim=IN_DIM, seq_dim=SEQ_DIM, pair_dim=PAIR_DIM,
                  n_seq_blocks=N_SEQ_BLOCKS, n_pair_blocks=N_PAIR_BLOCKS,
-                 n_heads=N_HEADS, dropout=DROPOUT, use_relpos=True):
+                 n_heads=N_HEADS, dropout=DROPOUT, use_relpos=True,
+                 symmetric=SYMMETRIC, grad_checkpoint=True):
         super().__init__()
+        # ON by default, and it is what makes whole-protein training fit: without
+        # it a 990-residue protein needs ~22 GB of stored activations, with it
+        # ~7.5 GB, for ~30% more time. Turn it off for a speed run on short chains.
+        self.grad_checkpoint = grad_checkpoint
+        self.symmetric = symmetric
         self.in_proj = nn.Linear(in_dim, seq_dim)
         # Reused from seq_encoder rather than reimplemented: same pre-LN block,
         # same RoPE attention, same masking semantics as the encoder upstream.
@@ -217,9 +292,10 @@ class ContactPredictor(nn.Module):
         )
         self.seq_norm = nn.LayerNorm(seq_dim)
 
-        self.pair_init = PairFeaturizer(seq_dim, pair_dim, use_relpos)
+        self.pair_init = PairFeaturizer(seq_dim, pair_dim, use_relpos,
+                                        symmetric=symmetric)
         self.pair_blocks = nn.ModuleList(
-            AxialBlock(pair_dim, n_heads, MLP_RATIO, dropout)
+            AxialBlock(pair_dim, n_heads, MLP_RATIO, dropout, symmetric)
             for _ in range(n_pair_blocks)
         )
         self.pair_norm = nn.LayerNorm(pair_dim)
@@ -233,7 +309,8 @@ class ContactPredictor(nn.Module):
             b.mlp[3].weight.data.mul_(scale)
         for b in self.pair_blocks:
             b.row_attn.out_proj.weight.data.mul_(scale)
-            b.col_attn.out_proj.weight.data.mul_(scale)
+            if not symmetric:
+                b.col_attn.out_proj.weight.data.mul_(scale)
             b.ffn[3].weight.data.mul_(scale)
 
         # Start predicting "no contact" everywhere. Contacts are a few percent of
@@ -254,7 +331,13 @@ class ContactPredictor(nn.Module):
 
         p = self.pair_init(h)
         for block in self.pair_blocks:
-            p = block(p, mask)
+            if self.grad_checkpoint and self.training and torch.is_grad_enabled():
+                # use_reentrant=False also preserves RNG state, so the dropout
+                # masks drawn during recomputation match the ones from the forward
+                # pass. Without that the gradients would be for a different model.
+                p = checkpoint(block, p, mask, use_reentrant=False)
+            else:
+                p = block(p, mask)
 
         logits = self.out(self.pair_norm(p)).squeeze(-1)      # (B, L, L)
         logits = 0.5 * (logits + logits.transpose(1, 2))
@@ -499,6 +582,39 @@ if __name__ == "__main__":
     print(f"(g) overfit one protein: loss {first:.3f} -> {last:.3f}, "
           f"long-range contact recovered: {bool(got)}  OK")
 
+    # ---- (i) symmetric mode: identical maths, less of it -------------------
+    # The pair tensor must be symmetric at EVERY depth, not just at the output --
+    # that is the property the dropped column pass relies on.
+    torch.manual_seed(7)
+    sym = ContactPredictor(symmetric=True, grad_checkpoint=False).eval()
+    with torch.no_grad():
+        h = sym.seq_norm(sym.in_proj(x))
+        for blk in sym.seq_blocks:
+            h = blk(h, mask)
+        p = sym.pair_init(h)
+        worst = (p - p.transpose(1, 2)).abs().max().item()
+        for d, blk in enumerate(sym.pair_blocks, 1):
+            p = blk(p, mask)
+            worst = max(worst, (p - p.transpose(1, 2)).abs().max().item())
+    assert worst < 1e-4, f"symmetric mode drifted asymmetric: {worst}"
+    n_sym = sum(q.numel() for q in sym.parameters())
+    print(f"(i) symmetric: max |p - p^T| over all depths = {worst:.2e}, "
+          f"{n_sym/1e6:.2f}M params vs {n_par/1e6:.2f}M  OK")
+
+    # ---- (j) checkpointing changes memory, not gradients -------------------
+    # Same seed, same input, one with recomputation and one without: the weight
+    # gradients must agree, or the recomputed forward is not the original one.
+    grads = {}
+    for ck in (False, True):
+        torch.manual_seed(11)
+        m = ContactPredictor(grad_checkpoint=ck).train()
+        contact_loss(m(x, mask), tgt, mask, pos_weight=torch.tensor(20.0)).backward()
+        grads[ck] = torch.cat([q.grad.flatten() for q in m.parameters()
+                               if q.grad is not None])
+    delta = (grads[False] - grads[True]).abs().max().item()
+    assert delta < 1e-4, f"checkpointing changed the gradients: {delta}"
+    print(f"(j) checkpointing: max gradient difference = {delta:.2e}  OK")
+
     # ---- (h) crop keeps the three tensors aligned -------------------------
     cx, cm_maps, cmask = crop_pair(torch.randn(2, 300, IN_DIM),
                                    torch.rand(2, 300, 300),
@@ -507,8 +623,16 @@ if __name__ == "__main__":
     print(f"(h) crop: 300 -> {cx.shape[1]} residues, maps {tuple(cm_maps.shape)}  OK")
 
     # ---- memory, since it is the thing that will actually stop you --------
-    print("\npair-tensor memory, ONE activation at PAIR_DIM=64, fp32:")
-    for L_ in (128, 192, 256, 512, 990):
-        mb = L_ * L_ * PAIR_DIM * 4 / 1e6
-        print(f"  L={L_:<5} {mb:8.1f} MB/protein   "
-              f"(a block holds ~4 of these; train with CROP={CROP})")
+    # Stored-activation estimate, in pair-sized tensors. DERIVED FROM THE CODE,
+    # not measured -- fusion, early frees and bf16 all move it. Treat as an order
+    # of magnitude and print torch.cuda.max_memory_allocated() on a real run.
+    print(f"\nestimated activation memory for ONE protein, PAIR_DIM={PAIR_DIM}, fp32")
+    print(f"  {'L':>6} {'plain':>9} {'+ckpt':>9} {'+ckpt+sym':>11}")
+    for L_ in (218, 512, 990):
+        cell_gb = L_ * L_ * PAIR_DIM * 4 / 1e9
+        plain = (4 * 21 + 5) * cell_gb            # every block's internals kept
+        ckpt = (4 + 21 + 5) * cell_gb             # boundaries + one live block
+        both = (4 + 15 + 5) * cell_gb             # symmetric block is 15, not 21
+        print(f"  {L_:>6} {plain:>8.1f}G {ckpt:>8.1f}G {both:>10.1f}G")
+    print(f"  (median chain is 218; 990 is the longest. CROP={CROP} -- 0 means "
+          f"whole proteins.)")
