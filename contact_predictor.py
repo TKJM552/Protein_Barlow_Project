@@ -468,7 +468,7 @@ def crop_pair(x, maps, mask, crop=CROP, generator=None):
     tensors so pair (i,j) still refers to the same residues.
     """
     B, L, _ = x.shape
-    if L <= crop:
+    if crop <= 0 or L <= crop:      # crop=0 is the default and means "don't"
         return x, maps, mask
     start = int(torch.randint(0, L - crop + 1, (1,), generator=generator).item())
     sl = slice(start, start + crop)
