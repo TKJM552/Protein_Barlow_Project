@@ -82,15 +82,41 @@ from seq_encoder import EMBED_DIM, TransformerBlock
 # --- dimensions ------------------------------------------------------------
 IN_DIM = EMBED_DIM         # 512. What both arms hand over; NOT independent of
                            # seq_encoder -- z_seq is this wide by construction.
-SEQ_DIM = 256              # 1D track width
+SEQ_DIM = 512              # 1D track width. Deliberately EQUAL to IN_DIM, so
+                           # in_proj compresses nothing.
+                           #
+                           # It was 256, on the mistaken grounds that narrowing
+                           # early saves pair memory. It does not: SEQ_DIM never
+                           # reaches an L^2 tensor, since pair_init maps
+                           # seq_dim -> PAIR_DIM. The 1D track is O(L) and its
+                           # width is nearly free in memory.
+                           #
+                           # The real reason to keep it at 512 is that a narrower
+                           # value is NOT NEUTRAL BETWEEN THE ARMS. in_proj runs
+                           # per residue, before any mixing. Arm B's embedding has
+                           # only 21 distinct vectors, so any width above 21 is
+                           # lossless for it. Arm A's z_seq is 512-d and Barlow
+                           # Twins' off-diagonal term actively decorrelates
+                           # dimensions, so it likely uses most of that width.
+                           # A bottleneck here penalises precisely the arm under
+                           # test, in the experiment built to test it.
 N_SEQ_BLOCKS = 2           # shallow ON PURPOSE: in arm A the input is already
                            # contextualised by a 6-block encoder, so depth here
                            # mostly buys capacity to memorise. Arm B gets the
                            # same 2 blocks -- an unfair advantage to arm A, and
                            # the fair-comparison cost of a shared architecture.
 PAIR_DIM = 64              # every activation is (B, L, L, PAIR_DIM); this is
-                           # the number that decides whether a batch fits
-N_PAIR_BLOCKS = 4
+                           # the number that decides whether a batch fits, and
+                           # the ONLY width that multiplies into L^2
+N_PAIR_BLOCKS = 8          # was 4. With grad_checkpoint on, DEPTH here is nearly
+                           # free in memory -- each extra block stores one saved
+                           # boundary tensor, not the ~21 it computes inside --
+                           # so 4 -> 8 costs ~13% peak memory and doubles the
+                           # capacity of the track that does the actual pair
+                           # reasoning. At SEQ_DIM=256/4 blocks, 85% of the
+                           # parameters sat in 1D preprocessing and 0.30M in the
+                           # pair track, which is backwards for a contact model.
+                           # WIDTH is the expensive dial; depth is not.
 N_HEADS = 4
 MLP_RATIO = 4
 DROPOUT = 0.1
