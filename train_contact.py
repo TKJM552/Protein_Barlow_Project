@@ -34,7 +34,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 from torch import amp
-from torch.utils.data import DataLoader, Sampler
+from torch.utils.data import DataLoader, Sampler, Subset
 
 import config
 import train
@@ -144,7 +144,47 @@ class PairBudgetSampler(Sampler):
         return len(self.batches)
 
 
-def build_pair_loaders(seed, budget):
+def cap_train_by_cluster(train_set, cap):
+    """Keep at most `cap` proteins per 30%-identity cluster, TRAIN ONLY.
+
+    The dataset is 7.2x redundant -- 135,136 proteins over 21,264 clusters -- so
+    most of an epoch is spent re-learning near-duplicate crystal forms of a protein
+    it saw minutes ago. At full length an epoch is 12.5e9 pair-cells and 4 hours;
+    at cap=1 it is ~1.7e9 and about 35 minutes, for the same 21,264 distinct
+    proteins.
+
+    Preferred over --crop for buying time, because cropping removes INFORMATION
+    (pairs further apart than the crop stop being a training target) whereas this
+    removes REDUNDANCY. The cost is real but different: near-duplicate structures
+    are mild augmentation -- different ligands and conformations give genuinely
+    different contact maps -- so capping trades a little augmentation for a lot of
+    wall clock.
+
+    VAL is untouched. Capping it would change what P@L/5 is measured on, and the
+    whole point is that the arms are compared on identical ground.
+    """
+    ids = train.dataset_pdb_ids(train_set)
+    clusters = config.read_clusters()
+    if not clusters:
+        print("  WARNING: no pdb_clusters.txt -- --max-per-cluster ignored")
+        return train_set
+    seen, keep = {}, []
+    for i, pid in enumerate(ids):
+        # Proteins with no cluster assignment are kept, not dropped: an absent
+        # entry means unknown, not "duplicate of something".
+        c = clusters.get(pid.lower())
+        if c is None:
+            keep.append(i)
+            continue
+        if seen.get(c, 0) < cap:
+            seen[c] = seen.get(c, 0) + 1
+            keep.append(i)
+    print(f"  --max-per-cluster {cap}: {len(ids):,} -> {len(keep):,} train proteins "
+          f"over {len(seen):,} clusters")
+    return Subset(train_set, keep)
+
+
+def build_pair_loaders(seed, budget, max_per_cluster=0):
     """Train/val loaders over train.py's OWN cluster-grouped split.
 
     build_loaders() is called for the split, not the loaders: a random split puts
@@ -154,6 +194,9 @@ def build_pair_loaders(seed, budget):
     """
     tr0, va0, n_train, n_val = train.build_loaders()
     train_set, val_set = tr0.dataset, va0.dataset
+    if max_per_cluster:
+        train_set = cap_train_by_cluster(train_set, max_per_cluster)
+        n_train = len(train_set)
     kw = dict(collate_fn=collate_pad, num_workers=train.NUM_WORKERS,
               pin_memory=train.DEVICE.type == "cuda")
     tr = DataLoader(train_set, batch_sampler=PairBudgetSampler(
@@ -373,6 +416,7 @@ def save_checkpoint(path, args, model, provider, epoch, metrics,
         "encoder_ckpt": args.encoder_ckpt, "seed": args.seed,
         "unfrozen": args.unfreeze,
         "crop": args.crop, "pair_budget": args.pair_budget,
+        "max_per_cluster": args.max_per_cluster,
         "split": train._split_fingerprint(),
         "model": model.state_dict(),
         # Skipped ONLY for a frozen pretrained encoder, which is unchanged and
@@ -494,6 +538,13 @@ def main():
                          "--lr / 10). A single LR across both lets large early "
                          "updates wreck the pretrained weights while the predictor "
                          "is still random")
+    ap.add_argument("--max-per-cluster", type=int, default=0,
+                    help="keep at most N training proteins per 30%%-identity "
+                         "cluster (0 = all). The dataset is 7.2x redundant, so "
+                         "N=1 cuts an epoch ~7x while keeping all 21,264 distinct "
+                         "proteins. Preferred over --crop for buying wall clock: "
+                         "cropping removes information, this removes duplication. "
+                         "VAL is never capped. Must MATCH across arms")
     ap.add_argument("--eval-proteins", type=int, default=EVAL_PROTEINS,
                     help="val proteins scored each epoch, drawn once and then "
                          "fixed. Eval is uncropped and one protein at a time, so "
@@ -526,8 +577,8 @@ def main():
     train.set_seed(args.seed)
     os.makedirs(args.out_dir, exist_ok=True)
 
-    tr_loader, val_set, n_train, n_val = build_pair_loaders(args.seed,
-                                                            args.pair_budget)
+    tr_loader, val_set, n_train, n_val = build_pair_loaders(
+        args.seed, args.pair_budget, args.max_per_cluster)
     g = torch.Generator().manual_seed(args.seed)
     eval_idx = torch.randperm(len(val_set),
                               generator=g)[:args.eval_proteins].tolist()
