@@ -9,11 +9,17 @@ Written down because none of it is derivable from the code or git history.
 
 ---
 
-## Status: it retrieves unseen proteins, and it does not predict contacts
+## Status: it predicts contacts, and the linear probe was lying
 
-The full-scale run is done. The one-line summary is that **the model learned
-something real and the two headline diagnostics disagree about whether that
-something is useful**, which is the state of play as of 2026-08-05.
+As of 2026-08-08, a contact transformer on the FROZEN pretrained encoder reaches
+**P@L/5 0.335 against a distance-only baseline of 0.039** on long-range contacts
+(`|i-j| > 12`), on cluster-disjoint val proteins. That is 8.6x the trivial prior,
+and the first time anything in this project has beaten it.
+
+It also overturns this file's previous headline. The linear probe (TEST 5) scored
+the same frozen encoder at **0.028** and printed "pretraining added NOTHING". The
+information was there; a single linear layer over pairs could not see it. See
+*The contact predictor: results* below.
 
 | | |
 |---|---|
@@ -23,8 +29,8 @@ something is useful**, which is the state of play as of 2026-08-05.
 | Split | 135,147 train / 15,022 val, grouped by 30% identity |
 | Cost | 9,756 steps/epoch, 390,240 steps total, ~6 h |
 | Best checkpoint | **epoch 40**, val 596.319 — but see the selection bug below |
-| **Holds** | cross-modal retrieval on unseen families: **54% top-1 vs 6% random**, and rising with training |
-| **Fails** | linear contact probe: **P@L/5 0.028 vs 0.029 random**, and falling with training |
+| **Holds** | contact prediction: **P@L/5 0.335 vs 0.039 distance-only**; cross-modal retrieval **54% top-1 vs 6% random** |
+| **Superseded** | the linear contact probe, which read 0.028 on the encoder a transformer reads 0.335 from |
 | Superseded | the two 4,966-structure arms, kept further down as history |
 
 Run history, so the numbers below are attributable:
@@ -36,11 +42,11 @@ Run history, so the numbers below are attributable:
 | **full** | **150,169** | **40** | **on** | epoch 40, val 596.319 | `/workspace/checkpoints/best.pt` |
 | short | 150,169 | 10 | on | epoch 10, val 594.084 | `/workspace/ck10/`, epochs 5 and 10 kept |
 
-**Where a new session should start:** the pretraining phase is finished and written
-up. What is not done is the experiment that says whether any of it was worth doing
-— `contact_predictor.py` and `train_contact.py` are built, self-tested and **never
-run**. See *The contact predictor and the two-arm experiment* below, then item 1 of
-*Next, in order*. Everything between those two points is background.
+**Where a new session should start:** *The contact predictor: results* below. The
+pretraining phase is finished and written up; the frozen pretrained arm of the
+downstream experiment is trained and works; the `scratch` control is the open item
+that decides how much of it was pretraining. Everything between here and there is
+background.
 
 ---
 
@@ -576,8 +582,8 @@ default.
 
 ## The contact predictor and the two-arm experiment
 
-**Status: built, self-tested, never trained.** Two files, both committed, neither
-has produced a result. This section is the handover.
+**Status: the frozen pretrained arm is trained and it works.** The `random` arm
+diverged rather than converged, and `scratch` is still pending. Results below.
 
 ### Why it exists
 
@@ -729,6 +735,113 @@ repeating the selection that picked the worst-agreement checkpoint on the 150k r
 The banner prints measured `torch.cuda.max_memory_allocated()` after the first
 epoch. **Retune `--pair-budget` from that number, not from the table above**, which
 is derived from reading the code rather than from a GPU.
+
+### Results: the frozen pretrained arm
+
+2026-08-08. 12 epochs, `--seed 0 --pair-budget 2400000 --max-per-cluster 1
+--amp-dtype bf16`, 19,005 train proteins over 19,005 clusters, 678 steps/epoch,
+8,136 steps, ~5 h on a 4090. Scored on 200 cluster-disjoint val proteins.
+
+| epoch | 1 | 3 | 6 | 9 | 11 | 12 |
+|---|---|---|---|---|---|---|
+| P@L/5, `\|i-j\| > 12` | 0.140 | 0.251 | 0.278 | 0.331 | **0.335** | 0.335 |
+| P@L/5, `\|i-j\| >= 24` | 0.097 | 0.198 | 0.232 | 0.275 | 0.282 | 0.280 |
+| train loss | 0.876 | 0.513 | 0.475 | 0.452 | 0.442 | 0.440 |
+| val loss | 0.818 | 0.720 | 0.664 | 0.639 | 0.634 | 0.634 |
+
+**Distance-only on the same pool: 0.039 (`>12`) and 0.034 (`>=24`).** So 8.6x and
+8.3x the trivial prior. Train and val fall together with a small gap and P@L/5
+plateaus by epoch 11 -- no overfitting, and roughly converged at this budget.
+
+This is the first result in the project to beat distance-only on anything.
+
+### The linear probe under-reported by 12x
+
+Same frozen encoder, same metric, same `|i-j| > 12`:
+
+| readout on the same `z_seq` | P@L/5 | distance-only on its pool |
+|---|---|---|
+| linear probe, TEST 5 | 0.028 | 0.038 -- **loses** |
+| **contact transformer** | **0.335** | 0.039 -- **wins 8.6x** |
+
+**A 12x difference from changing the READOUT, not the representation.** And the
+comparison is sounder than two separate experiments usually are, because the
+distance-only baseline landed at 0.038 and 0.039 in the two setups -- that shared
+reference says the protein pools were comparable in difficulty, so the gap is about
+the probe rather than the data.
+
+TEST 5's printed verdict on this encoder was *"pretraining added NOTHING over
+random weights"*. That was wrong, and this file repeated it. The information was in
+`z_seq`; a single linear layer over `[v_i+v_j, v_i*v_j]` could not extract it.
+
+**Consequence: TEST 5 is retired as an arbiter.** Keep it as a two-minute smoke
+check on a new Barlow checkpoint before committing 5 h of contact training, and
+read its verdict text as a hypothesis rather than a result. The general lesson is
+the one that generalises: *a probe that fails tells you about the probe unless you
+have shown the probe can succeed.* TEST 5 had no such positive control.
+
+### The `random` arm collapsed rather than converged
+
+20 epochs (a `$COMMON` that lost its `--epochs 12`, so it got MORE training than
+the pretrained arm, not less):
+
+| epoch | 1 | 3 | 5 | 6 | 16 | 20 |
+|---|---|---|---|---|---|---|
+| P@L/5 `>12` | 0.034 | 0.041 | **0.065** | 0.019 | 0.030 | 0.031 |
+| train loss | 1.425 | **0.699** | 0.896 | 1.054 | 1.084 | 1.085 |
+
+Train loss *rose* after epoch 3 and then froze to four decimals -- the model
+settled into predicting the base rate everywhere and stopped learning. Its best
+P@L/5 (0.065) is barely above distance-only (0.040); its final (0.031) is below.
+
+So pretrained beats random by ~5x at best-vs-best, **but that margin is inflated**:
+part of it is an optimisation failure, not a statement about random features. A
+frozen random 18.9M-parameter encoder emits unstructured high-variance features and
+the shared LR diverged on them. `scratch` is the control that does not have this
+problem, because its input embedding is trainable.
+
+### The confound that is NOT resolved
+
+The pretrained encoder has a **48.6x train/val memorisation gap**. If the contact
+predictor's val proteins overlap the encoder's *training* proteins, arm A is partly
+scored on chains the encoder memorised.
+
+The splits should align -- same seed, same cluster grouping -- but the dataset
+changed on rebuild: 21,265 clusters / 135,147 train then, 21,264 / 135,136 now.
+`split_by_cluster` does `sorted(groups)` then `random.Random(SEED).shuffle(keys)`,
+and that permutation is **not stable** to small membership changes. Measured on a
+21,265-key list:
+
+| perturbation | val-set overlap |
+|---|---|
+| drop the last key | 77.9% |
+| drop 1 random key | 55.4% |
+| drop 5 random keys | **14.0%** (chance is 10%) |
+
+So somewhere between 15% and 80% of the contact predictor's val proteins were in
+the Barlow encoder's training set, and there is no record of the original split to
+check against. `_split_fingerprint()` stores `n_clusters`, not the ids.
+
+Against panic: TEST 5 probed the same encoder on a pool that was also ~90% Barlow
+training proteins and found nothing. For memorisation to explain 0.335, the encoder
+would have to have memorised contact geometry that a linear probe cannot see but a
+transformer can -- possible, and exactly what the section above establishes is
+possible. **Unresolved.**
+
+Two fixes for next time, neither retrospective: have `_split_fingerprint()` store a
+hash of the val id list, and freeze the dataset before pretraining rather than
+rebuilding it.
+
+### Open
+
+- **`scratch`** -- 12 epochs, identical settings. No pretraining and therefore no
+  memorisation advantage, and a trainable input so it should converge. If it lands
+  near 0.335 the predictor was doing the work; near 0.05 and pretraining is the
+  whole story.
+- **`--unfreeze`** -- the product setting; the frozen-vs-fine-tuned gap measures how
+  much the representation already held.
+- **`--no-relpos`** -- how much of 0.335 came from the `|i-j|` embedding. Beating
+  distance-only 8.6x already argues it is not mostly that.
 
 ### Verified, and not
 
